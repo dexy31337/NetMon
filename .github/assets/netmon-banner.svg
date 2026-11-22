@@ -2,41 +2,61 @@
   <title id="title">NetMon</title>
   <defs>
     <linearGradient id="panel" x2="688" y2="176" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#17132b"/>
-      <stop offset="1" stop-color="#0a0913"/>
+      <stop stop-color="#241d3b"/>
+      <stop offset=".56" stop-color="#1b172d"/>
+      <stop offset="1" stop-color="#111322"/>
     </linearGradient>
     <linearGradient id="frame" x2="688" y2="176" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#00f0ff" stop-opacity=".64"/>
-      <stop offset=".62" stop-color="#373150"/>
-      <stop offset="1" stop-color="#ff2e97" stop-opacity=".48"/>
+      <stop stop-color="#94dfec" stop-opacity=".48"/>
+      <stop offset=".58" stop-color="#514365"/>
+      <stop offset="1" stop-color="#dc9bcc" stop-opacity=".35"/>
     </linearGradient>
-    <linearGradient id="signal" x1="413" x2="651" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#00f0ff" stop-opacity="0"/>
-      <stop offset=".6" stop-color="#00f0ff"/>
-      <stop offset="1" stop-color="#8cf7ff"/>
+    <linearGradient id="signal" x1="426" x2="641" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#9ed9ed" stop-opacity="0"/>
+      <stop offset=".65" stop-color="#9ed9ed" stop-opacity=".72"/>
+      <stop offset="1" stop-color="#c5f0f5"/>
     </linearGradient>
-    <pattern id="grid" width="16" height="16" patternUnits="userSpaceOnUse">
-      <path d="M16 0H0V16" fill="none" stroke="#8cf7ff" stroke-opacity=".13"/>
+    <radialGradient id="halo">
+      <stop stop-color="#b8a2f0" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#b8a2f0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x2="1" y2="1">
+      <stop stop-color="#413454"/>
+      <stop offset="1" stop-color="#22273f"/>
+    </linearGradient>
+    <pattern id="grid" width="14" height="14" patternUnits="userSpaceOnUse">
+      <circle cx="7" cy="7" r="1" fill="#b8cdea" opacity=".16"/>
     </pattern>
     <clipPath id="edges">
-      <path d="M18 1H670L687 18V158L670 175H18L1 158V18Z"/>
+      <rect x="1" y="1" width="686" height="174" rx="30"/>
     </clipPath>
   </defs>
   <g clip-path="url(#edges)">
     <path fill="url(#panel)" d="M0 0H688V176H0Z"/>
-    <path fill="url(#grid)" opacity=".64" d="M430 0H688V176H430Z"/>
-    <path d="M450 128H650M450 48H650" stroke="#52476d" stroke-opacity=".38" stroke-dasharray="2 6"/>
-    <path d="M413 104H473L485 85L498 104H527L542 65L561 119L576 89L588 104H651"
-          fill="none" stroke="url(#signal)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-    <circle cx="651" cy="104" r="9" fill="#00f0ff" opacity=".16"/>
-    <circle cx="651" cy="104" r="3" fill="#8cf7ff"/>
-    <path d="M628 54H653M641 43V65" stroke="#ff2e97" stroke-opacity=".65"/>
+    <ellipse cx="192" cy="49" rx="260" ry="132" fill="url(#halo)"/>
+    <rect x="453" y="35" width="199" height="106" rx="20" fill="url(#grid)"/>
+    <path d="M426 97H470C491 97 490 77 504 77S520 110 532 110S548 65 563 65S580 103 595 103S613 97 641 97"
+          fill="none" stroke="url(#signal)" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="641" cy="97" r="9" fill="#a1e6ef" opacity=".14"/>
+    <circle cx="641" cy="97" r="3.5" fill="#c5f0f5"/>
   </g>
-  <path d="M18 1H670L687 18V158L670 175H18L1 158V18Z" fill="none" stroke="url(#frame)"/>
-  <path d="M28 1H112M582 175H651" stroke="#00f0ff" stroke-opacity=".75" stroke-width="2"/>
-  <path d="M63 45H118L131 58V112L118 125H63L50 112V58Z" fill="#0b1422" stroke="#00f0ff" stroke-opacity=".42"/>
-  <path d="M69 105V65L112 105V65" fill="none" stroke="#00f0ff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="69" cy="105" r="4" fill="#e3faff"/>
-  <circle cx="112" cy="65" r="4" fill="#ff2e97"/>
-  <text x="158" y="110" fill="#f0edff" font-family="Segoe UI, Arial, sans-serif" font-weight="700" font-size="66" letter-spacing="-2">Net<tspan fill="#8cf7ff">Mon</tspan></text>
+  <rect x="1" y="1" width="686" height="174" rx="30" fill="none" stroke="url(#frame)"/>
+  <rect x="42" y="45" width="86" height="86" rx="26" fill="url(#mark)" stroke="#b9c5e9" stroke-opacity=".44"/>
+  <path d="M65 106V75Q65 67 71 73L99 103Q105 109 105 101V69"
+        fill="none" stroke="#c2ecf5" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="65" cy="106" r="4.5" fill="#e7f8fc"/>
+  <circle cx="105" cy="69" r="4.5" fill="#e9b7de"/>
+  <!-- Custom wordmark outlines keep the rounded lettering consistent on every system. -->
+  <g fill="none" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#f3edfb">
+      <path d="M152 111V66Q152 63 154 66L185 110Q187 113 187 110V65"/>
+      <path d="M202 97H229C229 86 223 80 216 80C207 80 200 87 200 96C200 105 207 112 217 112Q224 112 228 108"/>
+      <path d="M246 71V102Q246 112 255 112Q259 112 262 110M239 82H260"/>
+    </g>
+    <g stroke="#c2ecf5">
+      <path d="M278 111V66Q278 63 280 66L301 93L322 66Q324 63 324 66V111"/>
+      <ellipse cx="353" cy="96" rx="16" ry="16"/>
+      <path d="M383 111V81M383 92C383 85 388 80 396 80C404 80 408 85 408 93V111"/>
+    </g>
+  </g>
 </svg>
