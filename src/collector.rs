@@ -1,4 +1,5 @@
 //! All unsafe Windows FFI is kept in this module. ETW callbacks never block on storage/UI.
+mod wire_capture;
 use crate::model::*;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::Sender;
@@ -344,6 +345,7 @@ unsafe fn enable(handle: CONTROLTRACE_HANDLE, provider: &GUID, ids: &[u16]) -> R
 
 pub struct Collector {
     sessions: Vec<Session>,
+    wire: wire_capture::Capture,
     pub counters: Arc<Counters>,
 }
 impl Collector {
@@ -351,6 +353,7 @@ impl Collector {
         let counters = Arc::new(Counters::default());
         let mut this = Self {
             sessions: Vec::new(),
+            wire: wire_capture::Capture::default(),
             counters,
         };
         let suffix = format!("{}-{}", std::process::id(), now_ms());
@@ -363,18 +366,22 @@ impl Collector {
         this.sessions.push(Session::start(
             &format!("NetMon-DNS-AFD-{suffix}"),
             false,
-            tx,
+            tx.clone(),
             this.counters.clone(),
         )?);
+        this.wire.start(tx, this.counters.clone());
         Ok(this)
     }
     pub fn update_health(&self, h: &mut Health) {
+        self.wire.health(h);
         h.queue_lost = self.counters.queue_lost.load(Ordering::Relaxed);
         h.decode_errors = self.counters.decode_errors.load(Ordering::Relaxed);
         h.etw_lost = self.sessions.iter().map(Session::lost).sum();
         h.source_events = self.counters.sources.lock().unwrap().clone();
     }
     pub fn stop(&mut self, h: &mut Health) {
+        self.wire.stop();
+        self.wire.health(h);
         h.etw_lost = self.sessions.iter_mut().map(Session::stop).sum();
         h.queue_lost = self.counters.queue_lost.load(Ordering::Relaxed);
         h.decode_errors = self.counters.decode_errors.load(Ordering::Relaxed);
@@ -393,8 +400,10 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let callback = unsafe { &*(record.UserContext as *const Callback) };
     // No Rust unwind may cross the Windows callback boundary.
     let result = std::panic::catch_unwind(|| {
-        if same(&record.EventHeader.ProviderId, &AFD) {
-            let key = format!("AFD/{}", record.EventHeader.EventDescriptor.Id);
+        let provider = &record.EventHeader.ProviderId;
+        if same(provider, &AFD) || same(provider, &DNS) {
+            let name = if same(provider, &DNS) { "DNS" } else { "AFD" };
+            let key = format!("{name}/{}", record.EventHeader.EventDescriptor.Id);
             *callback
                 .counters
                 .sources

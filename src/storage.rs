@@ -1,7 +1,8 @@
-use crate::{engine::Engine, model::*};
+use crate::{collector, engine::Engine, model::*};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -93,6 +94,69 @@ impl Store {
         }
         Ok(s)
     }
+
+    pub fn delete(&mut self, id: &str, active_recording_id: Option<&str>) -> Result<bool> {
+        let tx = self.db.transaction()?;
+        let payload = tx.query_row("SELECT payload FROM recordings WHERE id=?1", [id], |row| {
+            row.get::<_, String>(0)
+        });
+        let recording: Recording = match payload {
+            Ok(payload) => serde_json::from_str(&payload)?,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        if active_recording_id == Some(id)
+            || (recording.ended.is_none()
+                && recording_owner_running(&recording, &collector::processes()))
+        {
+            return Ok(false);
+        }
+        let deleted = tx.execute("DELETE FROM recordings WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(deleted != 0)
+    }
+}
+
+pub fn active_recording_ids(
+    recordings: &[Recording],
+    current_recording_id: Option<&str>,
+) -> HashSet<String> {
+    let mut active: HashSet<_> = recordings
+        .iter()
+        .filter(|recording| current_recording_id == Some(recording.id.as_str()))
+        .map(|recording| recording.id.clone())
+        .collect();
+    let unfinished: Vec<_> = recordings
+        .iter()
+        .filter(|recording| recording.ended.is_none() && !active.contains(&recording.id))
+        .collect();
+    if unfinished.is_empty() {
+        return active;
+    }
+    let processes = collector::processes();
+    active.extend(
+        unfinished
+            .into_iter()
+            .filter(|recording| recording_owner_running(recording, &processes))
+            .map(|recording| recording.id.clone()),
+    );
+    active
+}
+
+fn recording_owner_running(recording: &Recording, processes: &[ProcessInfo]) -> bool {
+    if recording.ended.is_some() {
+        return false;
+    }
+    let Some(pid) = recording
+        .id
+        .rsplit_once('-')
+        .and_then(|(_, pid)| pid.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    processes.iter().any(|process| {
+        process.pid == pid && (process.started == 0 || process.started <= recording.started)
+    })
 }
 
 pub fn export(snapshot: &Snapshot, dir: &Path) -> Result<PathBuf> {
@@ -177,6 +241,22 @@ pub fn export(snapshot: &Snapshot, dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recording(id: &str, started: i64, ended: Option<i64>) -> Recording {
+        Recording {
+            id: id.into(),
+            started,
+            ended,
+            config: CaptureConfig {
+                exe_filters: vec!["test.exe".into()],
+                include_children: false,
+                udp_idle_seconds: 30,
+                label: id.into(),
+            },
+            health: Health::default(),
+        }
+    }
+
     #[test]
     fn incremental_save_and_reload() {
         let dir =
@@ -213,5 +293,89 @@ mod tests {
         assert!(loaded.recording.unwrap().ended.is_some());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn delete_cascades_without_touching_neighbors_or_active_recording() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmon-delete-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut store = Store::open(&dir).unwrap();
+        for r in [
+            recording("older", 10, Some(11)),
+            recording("interrupted", 20, None),
+            recording("active", 30, None),
+        ] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO recordings VALUES (?1,?2,?3)",
+                    params![r.id, r.started, serde_json::to_string(&r).unwrap()],
+                )
+                .unwrap();
+            store
+                .db
+                .execute("INSERT INTO flows VALUES (?1,1,'{}')", [&r.id])
+                .unwrap();
+            store
+                .db
+                .execute("INSERT INTO dns VALUES (?1,1,'{}')", [&r.id])
+                .unwrap();
+        }
+
+        assert!(store.delete("interrupted", Some("active")).unwrap());
+        assert!(!store.delete("active", Some("active")).unwrap());
+        assert!(!store.delete("missing", Some("active")).unwrap());
+
+        let ids: Vec<_> = store.list().unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["active", "older"]);
+        for table in ["flows", "dns"] {
+            let count: i64 = store
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2, "unexpected rows in {table}");
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unfinished_recording_owner_distinguishes_running_process_from_pid_reuse() {
+        let unfinished = recording("20261122-120000-000-42", 2_000, None);
+        let owner = ProcessInfo {
+            pid: 42,
+            started: 1_000,
+            ..Default::default()
+        };
+        assert!(recording_owner_running(&unfinished, &[owner]));
+
+        let reused_pid = ProcessInfo {
+            pid: 42,
+            started: 3_000,
+            ..Default::default()
+        };
+        assert!(!recording_owner_running(&unfinished, &[reused_pid]));
+        assert!(!recording_owner_running(&unfinished, &[]));
+        assert!(recording_owner_running(
+            &unfinished,
+            &[ProcessInfo {
+                pid: 42,
+                started: 0,
+                ..Default::default()
+            }]
+        ));
+        assert!(!recording_owner_running(
+            &recording("20261122-120000-000-42", 2_000, Some(2_500)),
+            &[ProcessInfo {
+                pid: 42,
+                started: 1_000,
+                ..Default::default()
+            }]
+        ));
     }
 }

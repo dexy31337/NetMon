@@ -95,6 +95,23 @@ pub struct DnsQuery {
     pub duration_ms: Option<i64>,
     pub source: String,
 }
+pub const UDP_DNS_SOURCE: &str = "UDP/53 · ";
+impl DnsQuery {
+    pub fn status_label(&self) -> String {
+        if self.source.starts_with(UDP_DNS_SOURCE) {
+            return match self.status {
+                0 => "OK".into(),
+                1 => "FORMERR".into(),
+                2 => "SERVFAIL".into(),
+                3 => "NXDOMAIN".into(),
+                4 => "NOTIMP".into(),
+                5 => "REFUSED".into(),
+                code => format!("RCODE {code}"),
+            };
+        }
+        dns_status(self.status)
+    }
+}
 pub fn dns_type(t: u32) -> String {
     match t {
         1 => "A".into(),
@@ -143,13 +160,15 @@ pub struct Health {
     pub queue_lost: u64,
     pub etw_lost: u64,
     pub decode_errors: u64,
+    #[serde(default)]
+    pub dns_correlation_overflows: u64,
     pub messages: Vec<String>,
     #[serde(default)]
     pub source_events: std::collections::BTreeMap<String, u64>,
 }
 impl Health {
     pub fn incomplete(&self) -> bool {
-        self.queue_lost + self.etw_lost + self.decode_errors > 0
+        self.queue_lost + self.etw_lost + self.decode_errors + self.dns_correlation_overflows > 0
     }
 }
 
@@ -197,6 +216,10 @@ pub enum Event {
         at: i64,
         pid: u32,
     },
+    WireDns {
+        at: i64,
+        packet: crate::dns_wire::Datagram,
+    },
     Dns {
         at: i64,
         pid: u32,
@@ -243,6 +266,7 @@ impl Event {
             Self::Network { at, .. }
             | Self::ProcessEnd { at, .. }
             | Self::Dns { at, .. }
+            | Self::WireDns { at, .. }
             | Self::SocketCreate { at, .. }
             | Self::SocketBind { at, .. }
             | Self::SocketConnect { at, .. }

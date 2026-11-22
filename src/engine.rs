@@ -27,7 +27,8 @@ pub struct Engine {
     processes: HashMap<u32, Vec<ProcessInfo>>,
     active: HashMap<FlowKey, usize>,
     sockets: HashMap<u64, Socket>,
-    dns_pending: HashMap<(u32, String, u32, u128), Vec<i64>>,
+    dns_pending: HashMap<(u32, i64, String, u32, u128), Vec<i64>>,
+    wire_dns: crate::dns_wire::Tracker,
     selected: HashSet<(u32, i64)>,
 }
 
@@ -57,6 +58,7 @@ impl Engine {
             active: HashMap::new(),
             sockets: HashMap::new(),
             dns_pending: HashMap::new(),
+            wire_dns: Default::default(),
             selected: HashSet::new(),
         };
         for p in processes {
@@ -186,6 +188,10 @@ impl Engine {
                 kind,
             } => {
                 let p = self.process(pid, at);
+                if protocol == Protocol::Udp && remote.port() == 53 {
+                    self.wire_dns
+                        .kernel(at, local, remote, bytes, kind == NetKind::Receive, &p);
+                }
                 if !self.wanted(&p) {
                     return;
                 }
@@ -288,6 +294,7 @@ impl Engine {
                 }
                 self.dirty.insert(i);
             }
+            Event::WireDns { at, packet } => self.wire_dns.packet(at, packet),
             Event::Dns {
                 at,
                 pid,
@@ -302,7 +309,7 @@ impl Engine {
                 if !self.wanted(&p) {
                     return;
                 }
-                let key = (pid, name.to_lowercase(), query_type, activity);
+                let key = (pid, p.started, name.to_lowercase(), query_type, activity);
                 if !completed {
                     self.dns_pending.entry(key).or_default().push(at);
                     return;
@@ -432,7 +439,31 @@ impl Engine {
         }
     }
 
+    fn collect_wire_dns(&mut self, through: i64) {
+        let mut completed = Vec::new();
+        self.wire_dns
+            .drain(through, |owner, query| completed.push((owner, query)));
+        for ((pid, started), mut query) in completed {
+            let p = self.process(pid, query.at);
+            if p.started == started && self.wanted(&p) {
+                query.process = p;
+                query.id = self.snapshot.dns.len() as u64 + 1;
+                self.snapshot.dns.push(query);
+            }
+        }
+        let health = &mut self.snapshot.recording.as_mut().unwrap().health;
+        if self.wire_dns.lost > health.dns_correlation_overflows {
+            if health.dns_correlation_overflows == 0 {
+                health.messages.push(
+                    "Часть DNS по UDP пропущена из-за переполнения буфера сопоставления.".into(),
+                );
+            }
+            health.dns_correlation_overflows = self.wire_dns.lost;
+        }
+    }
+
     pub fn tick(&mut self, at: i64) {
+        self.collect_wire_dns(at);
         let idle = self
             .snapshot
             .recording
@@ -458,6 +489,7 @@ impl Engine {
     }
 
     pub fn finish(&mut self) {
+        self.collect_wire_dns(i64::MAX);
         let at = now_ms();
         self.snapshot.running = false;
         self.snapshot.recording.as_mut().unwrap().ended = Some(at);

@@ -1,4 +1,5 @@
 mod instruments;
+mod servers;
 use crate::{
     collector,
     model::*,
@@ -9,8 +10,9 @@ use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use instruments::{Overview, idle_chip, nav_icon, share_meter};
 use serde::{Deserialize, Serialize};
+use servers::{DnsCandidates, FlowFilter, ServerTarget, Servers, flow_search_matches};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     net::IpAddr,
     path::PathBuf,
     sync::Arc,
@@ -402,20 +404,6 @@ fn read_filters<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D
         .collect())
 }
 
-#[derive(Default)]
-struct Server {
-    remote: String,
-    protocol: String,
-    processes: BTreeSet<String>,
-    names: BTreeSet<String>,
-    connections: usize,
-    failed: usize,
-    sent: u64,
-    received: u64,
-    first: i64,
-    last: i64,
-}
-
 struct App {
     dir: PathBuf,
     settings: Settings,
@@ -424,18 +412,20 @@ struct App {
     viewing: Option<Arc<Snapshot>>,
     tab: usize,
     search: String,
+    server_drilldown: Option<ServerTarget>,
     protocol: usize,
     only_errors: bool,
     hide_loopback: bool,
     message: String,
     history: Vec<Recording>,
+    active_history: std::collections::HashSet<String>,
+    pending_history_delete: Option<String>,
     process_picker: ProcessPicker,
     selected_flow: Option<u64>,
     selected_dns: Option<u64>,
     stopping: bool,
-    servers: Vec<Server>,
-    server_snapshot: Option<Arc<Snapshot>>,
-    server_filter: String,
+    servers: Servers,
+    expanded_servers: BTreeSet<IpAddr>,
     overview: Overview,
     overview_snapshot: std::sync::Weak<Snapshot>,
 }
@@ -458,29 +448,7 @@ pub fn run() -> eframe::Result {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
-            let mut app = App {
-                dir,
-                settings,
-                capture: None,
-                live: Arc::new(Snapshot::default()),
-                viewing: None,
-                tab: 0,
-                search: String::new(),
-                protocol: 0,
-                only_errors: false,
-                hide_loopback: false,
-                message: String::new(),
-                history: vec![],
-                process_picker: ProcessPicker::default(),
-                selected_flow: None,
-                selected_dns: None,
-                stopping: false,
-                servers: vec![],
-                server_snapshot: None,
-                server_filter: String::new(),
-                overview: Overview::default(),
-                overview_snapshot: std::sync::Weak::new(),
-            };
+            let mut app = App::new(dir, settings);
             app.refresh_history();
             Ok(Box::new(app))
         }),
@@ -488,6 +456,34 @@ pub fn run() -> eframe::Result {
 }
 
 impl App {
+    fn new(dir: PathBuf, settings: Settings) -> Self {
+        Self {
+            dir,
+            settings,
+            capture: None,
+            live: Arc::new(Snapshot::default()),
+            viewing: None,
+            tab: 0,
+            search: String::new(),
+            server_drilldown: None,
+            protocol: 0,
+            only_errors: false,
+            hide_loopback: false,
+            message: String::new(),
+            history: vec![],
+            active_history: std::collections::HashSet::new(),
+            pending_history_delete: None,
+            process_picker: ProcessPicker::default(),
+            selected_flow: None,
+            selected_dns: None,
+            stopping: false,
+            servers: Servers::default(),
+            expanded_servers: BTreeSet::new(),
+            overview: Overview::default(),
+            overview_snapshot: std::sync::Weak::new(),
+        }
+    }
+
     fn busy(&self) -> bool {
         self.capture.as_ref().is_some_and(|c| !c.finished())
     }
@@ -517,10 +513,67 @@ impl App {
     }
     fn refresh_history(&mut self) {
         match Store::open(&self.dir).and_then(|s| s.list()) {
-            Ok(h) => self.history = h,
+            Ok(h) => {
+                let current_recording_id = self
+                    .capture
+                    .as_ref()
+                    .and_then(|_| self.live.recording.as_ref())
+                    .map(|r| r.id.as_str());
+                self.active_history = storage::active_recording_ids(&h, current_recording_id);
+                self.history = h;
+            }
             Err(e) => self.message = format!("История: {e:#}"),
         }
     }
+
+    fn finish_history_delete(&mut self, id: &str, confirmed: bool) {
+        if !confirmed {
+            self.pending_history_delete = None;
+            return;
+        }
+        let current_id = self
+            .capture
+            .as_ref()
+            .and_then(|_| self.live.recording.as_ref())
+            .map(|r| r.id.as_str());
+        match Store::open(&self.dir).and_then(|mut store| store.delete(id, current_id)) {
+            Ok(true) => {
+                let was_viewing = self.viewing.as_ref().is_some_and(|snapshot| {
+                    snapshot.recording.as_ref().is_some_and(|r| r.id == id)
+                });
+                let was_live = self
+                    .live
+                    .recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.id == id);
+                let was_displayed = was_viewing || (self.viewing.is_none() && was_live);
+                if was_viewing {
+                    self.viewing = None;
+                }
+                if was_live {
+                    self.live = Arc::new(Snapshot::default());
+                }
+                if was_displayed {
+                    self.server_drilldown = None;
+                    self.expanded_servers.clear();
+                    self.selected_flow = None;
+                    self.selected_dns = None;
+                    self.search.clear();
+                    self.overview_snapshot = std::sync::Weak::new();
+                }
+                self.pending_history_delete = None;
+                self.refresh_history();
+                self.message = "Сохранённая запись удалена.".into();
+            }
+            Ok(false) => {
+                self.pending_history_delete = None;
+                self.refresh_history();
+                self.message = "Запись не удалена: она активна или уже отсутствует.".into();
+            }
+            Err(e) => self.message = format!("Не удалось удалить запись: {e:#}"),
+        }
+    }
+
     fn start(&mut self) {
         if !collector::is_elevated() {
             self.message = "Для записи запустите NetMon от имени администратора. История доступна без повышения прав.".into();
@@ -535,6 +588,8 @@ impl App {
         self.capture = Some(CaptureTask::start(config, self.dir.clone()));
         self.live = Arc::new(Snapshot::default());
         self.viewing = None;
+        self.server_drilldown = None;
+        self.expanded_servers.clear();
         self.stopping = false;
         self.selected_flow = None;
         self.selected_dns = None;
@@ -703,7 +758,10 @@ impl App {
                 "Соединения",
                 "TCP-соединения и UDP-сессии за время наблюдения",
             ),
-            ("DNS", "Запросы и результаты системного разрешения имён"),
+            (
+                "DNS",
+                "Результаты DNS-клиента Windows и прямых запросов приложений",
+            ),
             ("История", "Локальные записи наблюдений"),
         ];
         ui.horizontal(|ui| {
@@ -789,6 +847,8 @@ impl App {
                 if self.viewing.is_some() && ui.small_button("К текущей записи").clicked()
                 {
                     self.viewing = None;
+                    self.server_drilldown = None;
+                    self.expanded_servers.clear();
                 }
             });
             if r.health.incomplete() {
@@ -826,6 +886,14 @@ impl App {
                     .hint_text("Поиск: IP, домен, EXE…")
                     .desired_width(265.0),
             );
+            if (!self.search.is_empty() || (self.tab == 1 && self.server_drilldown.is_some()))
+                && ui.button("Очистить фильтр поиска").clicked()
+            {
+                self.search.clear();
+                self.server_drilldown = None;
+                self.selected_flow = None;
+                self.selected_dns = None;
+            }
             if self.tab != 2 {
                 egui::ComboBox::from_id_salt("protocol")
                     .selected_text(["TCP + UDP", "TCP", "UDP"][self.protocol])
@@ -853,35 +921,42 @@ impl App {
                 }
             });
         });
+        if self.tab == 1
+            && let Some(target) = self.server_drilldown
+        {
+            ui.label(caption(format!("Соединения с {target}")).color(NEON_SOFT));
+        }
         ui.add_space(12.0);
     }
 
-    fn flow_matches(&self, f: &Flow) -> bool {
-        (self.protocol == 0
-            || (self.protocol == 1 && f.protocol == Protocol::Tcp)
-            || (self.protocol == 2 && f.protocol == Protocol::Udp))
-            && (!self.only_errors || f.outcome == Outcome::Failed)
-            && (!self.hide_loopback || !f.remote.ip().is_loopback())
+    fn flow_filter(&self) -> FlowFilter {
+        FlowFilter {
+            protocol: match self.protocol {
+                1 => Some(Protocol::Tcp),
+                2 => Some(Protocol::Udp),
+                _ => None,
+            },
+            only_errors: self.only_errors,
+            hide_loopback: self.hide_loopback,
+        }
     }
 
     fn connections(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        let query = self.search.to_lowercase();
+        let query = self.search.trim().to_lowercase();
+        let dns = if query.is_empty() {
+            DnsCandidates::default()
+        } else {
+            DnsCandidates::new(&s.dns)
+        };
+        let filter = self.flow_filter();
         let rows: Vec<_> = s
             .flows
             .iter()
             .rev()
             .filter(|f| {
-                self.flow_matches(f)
-                    && (query.is_empty()
-                        || format!(
-                            "{} {} {} {}",
-                            f.process.exe,
-                            f.process.path,
-                            f.remote,
-                            f.local.map(|a| a.to_string()).unwrap_or_default()
-                        )
-                        .to_lowercase()
-                        .contains(&query))
+                filter.matches(f)
+                    && self.server_drilldown.is_none_or(|target| target.matches(f))
+                    && (query.is_empty() || flow_search_matches(f, &query, dns.for_flow(f)))
             })
             .collect();
         if rows.is_empty() {
@@ -998,15 +1073,21 @@ impl App {
             })
             .collect();
         if rows.is_empty() {
-            empty(
-                ui,
-                s,
-                "DNS-запросов пока нет",
-                "Здесь появятся результаты запросов через системный DNS-клиент Windows.",
-            );
+            let (title, hint) = if s.dns.is_empty() {
+                (
+                    "Результатов DNS пока нет",
+                    "Запишите запуск приложения. Здесь появятся результаты DNS-клиента Windows и подтверждённые пары запрос–ответ по UDP/53 через IPv4. При собственном DoH, DoT или обращении по готовому IP имён может не быть.",
+                )
+            } else {
+                (
+                    "Нет результатов по фильтру",
+                    "Очистите поиск или снимите флажок «Ошибки», чтобы увидеть сохранённые результаты DNS.",
+                )
+            };
+            empty(ui, s, title, hint);
             return;
         }
-        ui.label(RichText::new("Ответ системного резолвера; полный DNS-пакет и TTL не сохраняются. Собственный DoH приложения может быть не виден.").small().color(INK_FAINT));
+        ui.label(RichText::new("Результаты DNS-клиента Windows и завершённые обмены по UDP/53 через IPv4. Источник указан в карточке запроса.").small().color(INK_FAINT));
         egui::ScrollArea::horizontal().show(ui, |ui| {
             TableBuilder::new(ui)
                 .id_salt("dns-table")
@@ -1056,7 +1137,7 @@ impl App {
                                 mono(format!(
                                     "{} {}",
                                     if ok { "●" } else { "×" },
-                                    dns_status(d.status)
+                                    d.status_label()
                                 ))
                                 .color(if ok {
                                     NEON
@@ -1082,178 +1163,6 @@ impl App {
                         if row.response().clicked() {
                             self.selected_dns = Some(d.id);
                         }
-                    })
-                });
-        });
-    }
-
-    fn servers(&mut self, ui: &mut egui::Ui, snapshot: &Arc<Snapshot>) {
-        let filter = format!(
-            "{}:{}:{}:{}",
-            self.search, self.protocol, self.hide_loopback, self.only_errors
-        );
-        if self
-            .server_snapshot
-            .as_ref()
-            .is_none_or(|old| !Arc::ptr_eq(old, snapshot))
-            || filter != self.server_filter
-        {
-            // DNS links are candidates from the same process instance, never reverse-DNS guesses.
-            type DnsCandidates<'a> = HashMap<(u32, i64, IpAddr), Vec<(&'a str, i64)>>;
-            let mut names: DnsCandidates<'_> = HashMap::new();
-            for d in snapshot.dns.iter().filter(|d| d.status == 0) {
-                for token in d.results.split([';', ' ', '\t', '\r', '\n']) {
-                    if let Ok(ip) = token.parse::<IpAddr>() {
-                        names
-                            .entry((d.process.pid, d.process.started, ip.to_canonical()))
-                            .or_default()
-                            .push((&d.name, d.at));
-                    }
-                }
-            }
-            let query = self.search.to_lowercase();
-            let mut servers: BTreeMap<(String, String), Server> = BTreeMap::new();
-            for f in snapshot.flows.iter().filter(|f| self.flow_matches(f)) {
-                let candidates: BTreeSet<String> = names
-                    .get(&(
-                        f.process.pid,
-                        f.process.started,
-                        f.remote.ip().to_canonical(),
-                    ))
-                    .into_iter()
-                    .flatten()
-                    .filter(|(_, at)| *at <= f.first + 100 && f.first - *at <= 300_000)
-                    .map(|(n, _)| n.to_string())
-                    .collect();
-                if !query.is_empty()
-                    && !format!(
-                        "{} {} {} {:?}",
-                        f.remote, f.process.exe, f.process.path, candidates
-                    )
-                    .to_lowercase()
-                    .contains(&query)
-                {
-                    continue;
-                }
-                let key = (f.remote.to_string(), f.protocol.to_string());
-                let r = servers.entry(key.clone()).or_insert_with(|| Server {
-                    remote: key.0,
-                    protocol: key.1,
-                    first: f.first,
-                    ..Default::default()
-                });
-                r.processes.insert(f.process.exe.clone());
-                r.names.extend(candidates);
-                r.connections += 1;
-                r.failed += usize::from(f.outcome == Outcome::Failed);
-                r.sent += f.sent;
-                r.received += f.received;
-                r.first = r.first.min(f.first);
-                r.last = r.last.max(f.last);
-            }
-            self.servers = servers.into_values().collect();
-            self.servers
-                .sort_by_key(|s| std::cmp::Reverse(s.sent + s.received));
-            self.server_snapshot = Some(snapshot.clone());
-            self.server_filter = filter;
-        }
-        if self.servers.is_empty() {
-            empty(
-                ui,
-                snapshot,
-                "Куда обращается приложение?",
-                "Выберите EXE слева и начните запись. Здесь появятся серверы, доменные имена и объём трафика.",
-            );
-            return;
-        }
-        ui.label(caption(format!(
-            "{} адресов · по объёму трафика · домены — предположение по DNS за предыдущие 5 минут",
-            self.servers.len()
-        )));
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            TableBuilder::new(ui)
-                .id_salt("servers-table")
-                .striped(true)
-                .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::initial(210.0))
-                .column(Column::initial(48.0))
-                .column(Column::initial(190.0))
-                .column(Column::initial(200.0))
-                .column(Column::initial(60.0))
-                .column(Column::initial(60.0))
-                .column(Column::initial(100.0))
-                .column(Column::initial(100.0))
-                .header(28.0, |mut h| {
-                    for name in [
-                        "Сервер",
-                        "Тип",
-                        "Возможные DNS-имена",
-                        "Приложения",
-                        "Сессии",
-                        "Ошибки",
-                        "Отправлено",
-                        "Получено",
-                    ] {
-                        h.col(|ui| head(ui, name));
-                    }
-                })
-                .body(|body| {
-                    body.rows(34.0, self.servers.len(), |mut row| {
-                        let s = &self.servers[row.index()];
-                        row.col(|ui| {
-                            if ui
-                                .link(mono(&s.remote))
-                                .on_hover_text("Показать соединения этого адреса")
-                                .clicked()
-                            {
-                                self.search = s.remote.clone();
-                                self.tab = 1;
-                            }
-                        });
-                        row.col(|ui| {
-                            protocol_tag(
-                                ui,
-                                if s.protocol == "UDP" {
-                                    Protocol::Udp
-                                } else {
-                                    Protocol::Tcp
-                                },
-                            )
-                        });
-                        row.col(|ui| {
-                            let text = s.names.iter().cloned().collect::<Vec<_>>().join(", ");
-                            if text.is_empty() {
-                                ui.label(RichText::new("—").color(INK_FAINT));
-                            } else {
-                                ui.label(RichText::new(&text).color(INK))
-                                    .on_hover_text(&text);
-                            }
-                        });
-                        row.col(|ui| {
-                            ui.label(
-                                RichText::new(
-                                    s.processes.iter().cloned().collect::<Vec<_>>().join(", "),
-                                )
-                                .color(INK_DIM),
-                            );
-                        });
-                        row.col(|ui| {
-                            ui.label(mono(s.connections.to_string()).color(INK));
-                        });
-                        row.col(|ui| {
-                            ui.label(mono(s.failed.to_string()).color(if s.failed > 0 {
-                                PULSE
-                            } else {
-                                INK_FAINT
-                            }));
-                        });
-                        row.col(|ui| {
-                            ui.label(mono(bytes(s.sent)).color(NEON_SOFT));
-                        });
-                        row.col(|ui| {
-                            ui.label(mono(bytes(s.received)).color(RX));
-                        });
                     })
                 });
         });
@@ -1303,12 +1212,24 @@ impl App {
                             ui.label(caption(text).color(color));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let active = self.active_history.contains(&r.id);
+                            if ui
+                                .add_enabled(!active, egui::Button::new("Удалить…"))
+                                .on_disabled_hover_text(
+                                    "Эта запись сейчас ведётся одной из копий NetMon.",
+                                )
+                                .clicked()
+                            {
+                                self.pending_history_delete = Some(r.id.clone());
+                            }
                             if ui.button("Открыть").clicked() {
                                 match Store::open(&self.dir).and_then(|s| s.load(&r.id)) {
                                     Ok(s) => {
                                         self.viewing = Some(Arc::new(s));
                                         self.tab = 0;
                                         self.search.clear();
+                                        self.server_drilldown = None;
+                                        self.expanded_servers.clear();
                                         self.selected_flow = None;
                                         self.selected_dns = None;
                                     }
@@ -1321,6 +1242,53 @@ impl App {
                 ui.add_space(8.0);
             }
         });
+
+        if let Some(id) = self.pending_history_delete.clone() {
+            let recording = self.history.iter().find(|r| r.id == id).cloned();
+            let mut confirm = false;
+            let mut cancel = recording.is_none();
+            if let Some(r) = recording {
+                let modal = egui::Modal::new(egui::Id::new("delete-history-confirmation")).show(
+                    ui.ctx(),
+                    |ui| {
+                        ui.set_max_width(460.0);
+                        ui.label(display("Удалить сохранённую запись?", 21.0).color(INK));
+                        ui.add_space(6.0);
+                        ui.label(display(&r.config.label, 19.0).color(INK));
+                        ui.label(mono(timestamp(r.started)).color(INK_DIM));
+                        ui.add_space(8.0);
+                        ui.label(
+                            "Запись, все её соединения и DNS-запросы будут удалены без возможности восстановления.",
+                        );
+                        if r.ended.is_none() {
+                            alert(
+                                ui,
+                                AMBER,
+                                "Эта запись не завершена штатно, но сейчас не активна.",
+                            );
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Отмена").clicked() {
+                                cancel = true;
+                            }
+                            if ui
+                                .add(egui::Button::new("Удалить запись").fill(glow(PULSE, 0.24)))
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                        });
+                    },
+                );
+                cancel |= modal.should_close();
+            }
+            if cancel {
+                self.finish_history_delete(&id, false);
+            } else if confirm {
+                self.finish_history_delete(&id, true);
+            }
+        }
     }
 
     fn details(&mut self, ctx: &egui::Context, s: &Snapshot) {
@@ -1451,7 +1419,7 @@ impl App {
                             ui.end_row();
                             ui.label(caption("РЕЗУЛЬТАТ"));
                             ui.label(
-                                mono(format!("{} (код {})", dns_status(d.status), d.status))
+                                mono(format!("{} (код {})", d.status_label(), d.status))
                                     .color(if d.status == 0 { NEON } else { PULSE }),
                             );
                             ui.end_row();
@@ -1489,13 +1457,51 @@ impl ProcessPicker {
             [name] => name.clone(),
             names => format!("Выбрано приложений: {}", names.len()),
         };
-        let popup = egui::ComboBox::from_id_salt("exe-picker")
-            .selected_text(caption)
-            .width(204.0)
-            .truncate()
-            .height(340.0)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show_ui(ui, |ui| {
+        let popup_id = ui.make_persistent_id("exe-picker-popup");
+        let button = ui.add_sized(
+            [204.0, ui.spacing().interact_size.y],
+            egui::Button::new(caption).shortcut_text("   ").truncate(),
+        );
+        if button.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup_id));
+        }
+        let arrow =
+            button.rect.right_center() - egui::vec2(ui.spacing().button_padding.x + 5.0, 0.0);
+        let dy = if ui.memory(|m| m.is_popup_open(popup_id)) {
+            -2.0
+        } else {
+            2.0
+        };
+        ui.painter().add(egui::Shape::line(
+            vec![
+                arrow + egui::vec2(-4.0, -dy),
+                arrow + egui::vec2(0.0, dy),
+                arrow + egui::vec2(4.0, -dy),
+            ],
+            ui.style().interact(&button).fg_stroke,
+        ));
+        let screen = ui.ctx().screen_rect();
+        let below = screen.bottom() - button.rect.bottom();
+        let above = button.rect.top() - screen.top();
+        const POPUP_HEIGHT: f32 = 340.0;
+        let (placement, room) = if below >= POPUP_HEIGHT || below >= above {
+            (egui::AboveOrBelow::Below, below)
+        } else {
+            (egui::AboveOrBelow::Above, above)
+        };
+        egui::popup::popup_above_or_below_widget(
+            ui,
+            popup_id,
+            &button,
+            placement,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                // egui restores a popup's previous content size. Size the viewport
+                // from the window, independently of the last search result count.
+                let margins = egui::Frame::popup(ui.style()).total_margin().sum();
+                ui.set_width(280.0_f32.min(screen.width() - margins.x));
+                ui.set_height((room.min(POPUP_HEIGHT) - margins.y).max(1.0));
+                let opening = self.refreshed.is_none();
                 if self
                     .refreshed
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
@@ -1503,15 +1509,18 @@ impl ProcessPicker {
                     self.running = collector::executable_names();
                     self.refreshed = Some(std::time::Instant::now());
                 }
-                ui.add(
+                let search = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
-                        .desired_width(260.0)
+                        .desired_width(ui.available_width())
                         .hint_text("Поиск или имя EXE…"),
                 );
+                if opening {
+                    search.request_focus();
+                }
                 let query = self.search.trim().to_lowercase();
                 let choices = picker_choices(&self.running, filters, &query);
-                if !choices.contains_key(&query)
-                    && (query.ends_with(".exe") || query == "*")
+                if (query.ends_with(".exe") || query == "*")
+                    && !choices.iter().any(|(name, _)| name.to_lowercase() == query)
                     && ui
                         .button(format!("Добавить {}", self.search.trim()))
                         .clicked()
@@ -1521,21 +1530,38 @@ impl ProcessPicker {
                 if choices.is_empty() && !query.ends_with(".exe") && query != "*" {
                     ui.label("Совпадений нет");
                 }
-                for (key, (name, mut selected)) in choices {
-                    if ui
-                        .push_id(&key, |ui| ui.checkbox(&mut selected, &name))
-                        .inner
-                        .changed()
-                    {
-                        if selected {
-                            filters.push(name);
-                        } else {
-                            filters.retain(|n| n.to_lowercase() != key);
+                if choices.is_empty() {
+                    return;
+                }
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                let mut list = egui::ScrollArea::vertical()
+                    .id_salt("exe-rows")
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, false]);
+                if opening || search.changed() {
+                    list = list.vertical_scroll_offset(0.0);
+                }
+                let row_height = ui.spacing().interact_size.y;
+                list.show_rows(ui, row_height, choices.len(), |ui, rows| {
+                    for (name, checked) in &choices[rows] {
+                        let mut selected = *checked;
+                        let response = ui
+                            .push_id(name, |ui| ui.checkbox(&mut selected, name.as_str()))
+                            .inner;
+                        if response.on_hover_text(name).changed() {
+                            if selected {
+                                filters.push(name.clone());
+                            } else {
+                                let key = name.to_lowercase();
+                                filters.retain(|n| n.to_lowercase() != key);
+                            }
                         }
                     }
-                }
-            });
-        if popup.inner.is_none() {
+                });
+            },
+        );
+        if !ui.memory(|m| m.is_popup_open(popup_id)) {
             self.refreshed = None;
             self.search.clear();
         }
@@ -1545,11 +1571,7 @@ impl ProcessPicker {
     }
 }
 
-fn picker_choices(
-    running: &[String],
-    selected: &[String],
-    query: &str,
-) -> BTreeMap<String, (String, bool)> {
+fn picker_choices(running: &[String], selected: &[String], query: &str) -> Vec<(String, bool)> {
     let mut choices = BTreeMap::new();
     for (names, checked) in [(selected, true), (running, false)] {
         for name in names {
@@ -1561,7 +1583,9 @@ fn picker_choices(
             }
         }
     }
-    choices
+    let mut rows: Vec<_> = choices.into_values().collect();
+    rows.sort_by_key(|(_, selected)| !selected);
+    rows
 }
 
 impl eframe::App for App {
@@ -1713,19 +1737,86 @@ fn timestamp(at: i64) -> String {
 mod picker_tests {
     use super::*;
 
+    fn saved_recording(store: &mut Store, id: &str, started: i64) {
+        let mut engine = crate::engine::Engine::new(
+            CaptureConfig {
+                exe_filters: vec!["test.exe".into()],
+                include_children: false,
+                udp_idle_seconds: 30,
+                label: id.into(),
+            },
+            vec![],
+        );
+        let recording = engine.snapshot.recording.as_mut().unwrap();
+        recording.id = id.into();
+        recording.started = started;
+        engine.finish();
+        store.save(&mut engine).unwrap();
+    }
+
+    #[test]
+    fn history_delete_cancel_then_confirm_clears_displayed_recording() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmon-history-ui-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut store = Store::open(&dir).unwrap();
+        saved_recording(&mut store, "older", 10);
+        saved_recording(&mut store, "delete-me", 20);
+
+        let mut app = App::new(dir.clone(), Settings::default());
+        app.refresh_history();
+        app.live = Arc::new(store.load("delete-me").unwrap());
+        assert!(storage::export(&app.snapshot(), &dir).is_ok());
+
+        app.pending_history_delete = Some("delete-me".into());
+        app.finish_history_delete("delete-me", false);
+        assert!(app.pending_history_delete.is_none());
+        assert!(store.load("delete-me").is_ok());
+        assert_eq!(app.snapshot().recording.as_ref().unwrap().id, "delete-me");
+
+        app.pending_history_delete = Some("delete-me".into());
+        app.finish_history_delete("delete-me", true);
+        assert!(app.pending_history_delete.is_none());
+        assert!(store.load("delete-me").is_err());
+        assert!(app.snapshot().recording.is_none());
+        assert!(storage::export(&app.snapshot(), &dir).is_err());
+        assert_eq!(
+            store
+                .list()
+                .unwrap()
+                .into_iter()
+                .map(|recording| recording.id)
+                .collect::<Vec<_>>(),
+            ["older"]
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn one_choice_per_name_including_stopped_selections() {
         let running = ["GAME.exe", "game.exe", "Launcher.exe", "helper.exe"].map(String::from);
         let selected = ["Game.exe", "Game Editor.exe"].map(String::from);
         let choices = picker_choices(&running, &selected, "game");
         assert_eq!(
-            choices.into_values().collect::<Vec<_>>(),
+            choices,
             [
                 (String::from("Game Editor.exe"), true),
                 (String::from("Game.exe"), true)
             ]
         );
-        assert!(!picker_choices(&running, &selected, "")["launcher.exe"].1);
+        assert_eq!(
+            picker_choices(&running, &selected, ""),
+            [
+                ("Game Editor.exe".into(), true),
+                ("Game.exe".into(), true),
+                ("helper.exe".into(), false),
+                ("Launcher.exe".into(), false),
+            ]
+        );
     }
 
     #[test]
@@ -1747,26 +1838,48 @@ mod picker_tests {
     #[test]
     fn dropdown_search_and_selection_use_a_live_windows_executable() {
         let ctx = egui::Context::default();
+        apply_theme(&ctx);
         let mut picker = ProcessPicker::default();
-        let mut filters = Vec::new();
-        let mut labels = BTreeMap::new();
+        let saved = "zz-NetMon-stopped.exe";
+        let mut filters = vec![saved.to_owned()];
         let mut frame = |events: Vec<egui::Event>| {
             let output = ctx.run(
                 egui::RawInput {
                     events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1080.0, 680.0),
+                    )),
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| picker.show(ui, &mut filters));
+                    egui::SidePanel::left("navigation")
+                        .exact_width(244.0)
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add_space(380.0);
+                                picker.show(ui, &mut filters);
+                            });
+                        });
                 },
             );
-            labels.clear();
+            let mut labels = Vec::new();
             for clipped in output.shapes {
                 if let egui::Shape::Text(t) = clipped.shape {
-                    labels.insert(t.galley.job.text.clone(), t.pos + t.galley.size() * 0.5);
+                    let center = t.pos + t.galley.size() * 0.5;
+                    if clipped.clip_rect.contains(center) {
+                        labels.push((t.galley.job.text.clone(), center));
+                    }
                 }
             }
-            labels.clone()
+            labels
+        };
+        let locate = |labels: &[(String, egui::Pos2)], label: &str| {
+            labels
+                .iter()
+                .find(|(name, _)| name == label)
+                .unwrap_or_else(|| panic!("Missing {label:?} in {labels:?}"))
+                .1
         };
         let click = |pos| {
             vec![
@@ -1787,15 +1900,35 @@ mod picker_tests {
         };
         let exe = std::env::current_exe().unwrap();
         let name = exe.file_name().unwrap().to_str().unwrap();
-        let open = frame(vec![])["Выбрать приложения…"];
+        let open = locate(&frame(vec![]), saved);
         frame(click(open));
-        let search = frame(vec![])["Поиск или имя EXE…"];
+        frame(vec![]);
+        frame(vec![]);
+        let search = locate(&frame(vec![]), "Поиск или имя EXE…");
         frame(click(search));
         frame(vec![egui::Event::Text(name.to_uppercase())]);
-        let choice = frame(vec![])[name];
+        let choice = locate(&frame(vec![]), name);
         frame(click(choice));
         // The popup stays open for multiselect. Close it to check the saved selection.
         let outside = egui::pos2(700.0, 500.0);
+        frame(click(outside));
+        let reopen = locate(&frame(vec![]), "Выбрано приложений: 2");
+        frame(click(reopen));
+        frame(vec![]);
+        let reopened = frame(vec![]);
+        let running = collector::executable_names();
+        let mut visible: Vec<_> = reopened
+            .iter()
+            .filter(|(text, _)| text == saved || running.contains(text))
+            .collect();
+        visible.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+        assert!(
+            visible.len() >= 6,
+            "Visible EXEs after reopening: {visible:?}"
+        );
+        assert!(visible[..2].iter().any(|(text, _)| text == saved));
+        assert!(visible[..2].iter().any(|(text, _)| text == name));
+        frame(click(locate(&reopened, saved)));
         frame(click(outside));
         frame(vec![]);
         assert_eq!(filters, [name]);

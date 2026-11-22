@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use netmon::{collector, model::*, runtime::CaptureTask, storage};
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     path::PathBuf,
     thread,
     time::Duration,
@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     }
     if !args.iter().any(|a| a == "--self-test") {
         println!(
-            "netmon-probe --self-test [--output PATH]\nRun elevated. Creates local TCP/UDP traffic and two DNS queries; saves a report."
+            "netmon-probe --self-test [--output PATH]\nRun elevated. Creates TCP/UDP traffic, Windows resolver lookups and direct A/AAAA UDP DNS queries to the configured IPv4 resolver."
         );
         return Ok(());
     }
@@ -49,9 +49,11 @@ fn main() -> Result<()> {
     }
     ensure!(task.snapshot().running, "Collector startup timeout");
     // A child verifies process-start attribution as well as traffic correlation.
-    let status = std::process::Command::new(std::env::current_exe()?)
+    let mut child = std::process::Command::new(std::env::current_exe()?)
         .arg("--traffic")
-        .status()?;
+        .spawn()?;
+    let child_pid = child.id();
+    let status = child.wait()?;
     ensure!(status.success(), "Traffic generator failed");
     thread::sleep(Duration::from_secs(4));
     task.stop();
@@ -96,8 +98,8 @@ fn main() -> Result<()> {
     }
     for d in &snapshot.dns {
         println!(
-            "DNS {} {} {} -> {}",
-            d.process.exe, d.name, d.status, d.results
+            "DNS {} (PID {}) {} type={} status={} -> {} [{}]",
+            d.process.exe, d.process.pid, d.name, d.query_type, d.status, d.results, d.source
         );
     }
     ensure!(snapshot.error.is_none(), "Capture error");
@@ -133,8 +135,34 @@ fn main() -> Result<()> {
         snapshot
             .dns
             .iter()
-            .any(|d| d.name.trim_end_matches('.') == "example.com"),
-        "No process-attributed DNS result"
+            .any(|d| d.name.trim_end_matches('.') == "example.com"
+                && d.process.pid == child_pid
+                && d.status == 0
+                && !d.results.is_empty()
+                && d.source.ends_with("/ 3008")),
+        "No successful Windows DNS Client result attributed to the child"
+    );
+    for kind in [1, 28] {
+        ensure!(
+            snapshot.dns.iter().any(|d| d.name == "example.org"
+                && d.query_type == kind
+                && d.process.pid == child_pid
+                && d.source.starts_with("UDP/53")
+                && d.status == 0
+                && (kind == 28
+                    || d.results
+                        .split(';')
+                        .any(|s| matches!(s.trim().parse::<IpAddr>(), Ok(IpAddr::V4(_)))))),
+            "No verified direct UDP/53 type {kind} result attributed to child PID {child_pid}"
+        );
+    }
+    ensure!(
+        snapshot.dns.iter().any(|d| d.name == "netmon-probe.invalid"
+            && d.process.pid == child_pid
+            && d.source.starts_with(UDP_DNS_SOURCE)
+            && d.status == 3
+            && d.status_label() == "NXDOMAIN"),
+        "No direct NXDOMAIN (wire RCODE 3) attributed to child PID {child_pid}"
     );
     ensure!(!health.incomplete(), "Event loss or decode errors");
     ensure!(
@@ -205,6 +233,7 @@ fn traffic() -> Result<()> {
         .to_socket_addrs()
         .context("DNS example.com")?;
     let _ = (format!("netmon-{}.invalid", now_ms()).as_str(), 443).to_socket_addrs();
+    direct_dns()?;
     // IPv6 loopback is exercised where the host has it enabled.
     if let Ok(listener) = TcpListener::bind("[::1]:0") {
         let addr = listener.local_addr()?;
@@ -220,6 +249,71 @@ fn traffic() -> Result<()> {
         client.read_exact(&mut [0; 17])?;
         drop(client);
         server.join().unwrap();
+    }
+    Ok(())
+}
+
+fn direct_dns() -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_BUFFER_OVERFLOW,
+        NetworkManagement::IpHelper::{FIXED_INFO_W2KSP1, GetNetworkParams},
+    };
+    let mut len = 0;
+    ensure!(
+        unsafe { GetNetworkParams(std::ptr::null_mut(), &mut len) } == ERROR_BUFFER_OVERFLOW,
+        "Cannot size DNS settings"
+    );
+    let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+    let settings = buf.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>();
+    ensure!(
+        unsafe { GetNetworkParams(settings, &mut len) } == 0,
+        "Cannot read DNS settings"
+    );
+    let mut entry = unsafe { &raw const (*settings).DnsServerList };
+    let mut server = None;
+    while !entry.is_null() {
+        let info = unsafe { &*entry };
+        let bytes: Vec<u8> = info
+            .IpAddress
+            .String
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as u8)
+            .collect();
+        if let Ok(ip) = std::str::from_utf8(&bytes)?.parse::<Ipv4Addr>()
+            && !ip.is_unspecified()
+        {
+            server = Some(ip);
+            break;
+        }
+        entry = info.Next;
+    }
+    let server = server.context("No configured IPv4 DNS server")?;
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    sock.connect((server, 53))?;
+    sock.set_read_timeout(Some(Duration::from_secs(4)))?;
+    for (question, kind) in [
+        ("example.org", 1u16),
+        ("example.org", 28),
+        ("netmon-probe.invalid", 1),
+    ] {
+        let id = (now_ms() as u16).wrapping_add(kind);
+        let mut data = id.to_be_bytes().to_vec();
+        data.extend_from_slice(b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00");
+        for label in question.split('.') {
+            data.push(label.len() as u8);
+            data.extend_from_slice(label.as_bytes());
+        }
+        data.push(0);
+        data.extend_from_slice(&kind.to_be_bytes());
+        data.extend_from_slice(&1u16.to_be_bytes());
+        sock.send(&data)?;
+        let mut answer = [0; 4096];
+        let n = sock.recv(&mut answer).context("Direct UDP DNS reply")?;
+        ensure!(
+            n >= 12 && answer[..2] == id.to_be_bytes() && answer[2] & 0x80 != 0,
+            "Invalid direct DNS reply"
+        );
     }
     Ok(())
 }
