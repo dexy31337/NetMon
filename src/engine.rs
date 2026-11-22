@@ -20,6 +20,13 @@ struct Socket {
     flow: Option<usize>,
 }
 
+struct PendingDns {
+    process: ProcessInfo,
+    name: String,
+    first: Option<i64>,
+    last: i64,
+}
+
 pub struct Engine {
     pub snapshot: Snapshot,
     pub dirty: HashSet<usize>,
@@ -27,7 +34,7 @@ pub struct Engine {
     processes: HashMap<u32, Vec<ProcessInfo>>,
     active: HashMap<FlowKey, usize>,
     sockets: HashMap<u64, Socket>,
-    dns_pending: HashMap<(u32, i64, String, u32, u128), Vec<i64>>,
+    dns_pending: HashMap<(u32, i64, String, u32, u128), PendingDns>,
     wire_dns: crate::dns_wire::Tracker,
     selected: HashSet<(u32, i64)>,
 }
@@ -311,24 +318,35 @@ impl Engine {
                 }
                 let key = (pid, p.started, name.to_lowercase(), query_type, activity);
                 if !completed {
-                    self.dns_pending.entry(key).or_default().push(at);
+                    self.dns_pending
+                        .entry(key)
+                        .and_modify(|pending| {
+                            pending.first = None;
+                            pending.last = at;
+                        })
+                        .or_insert(PendingDns {
+                            process: p,
+                            name,
+                            first: Some(at),
+                            last: at,
+                        });
                     return;
                 }
-                let duration_ms = self
+                let request_at = self
                     .dns_pending
                     .remove(&key)
-                    .filter(|v| v.len() == 1)
-                    .and_then(|v| (at >= v[0]).then_some(at - v[0]));
+                    .and_then(|pending| pending.first.filter(|start| *start <= at));
                 self.snapshot.dns.push(DnsQuery {
                     id: self.snapshot.dns.len() as u64 + 1,
                     at,
                     process: p,
                     name,
                     query_type,
-                    status,
+                    status: Some(status),
                     results,
-                    duration_ms,
+                    duration_ms: request_at.map(|start| at - start),
                     source: "Microsoft-Windows-DNS-Client / 3008".into(),
+                    request_at,
                 });
             }
             Event::SocketCreate {
@@ -444,7 +462,7 @@ impl Engine {
         self.wire_dns
             .drain(through, |owner, query| completed.push((owner, query)));
         for ((pid, started), mut query) in completed {
-            let p = self.process(pid, query.at);
+            let p = self.process(pid, query.request_at.unwrap_or(query.at));
             if p.started == started && self.wanted(&p) {
                 query.process = p;
                 query.id = self.snapshot.dns.len() as u64 + 1;
@@ -462,8 +480,32 @@ impl Engine {
         }
     }
 
+    fn collect_unanswered_dns(&mut self, through: i64) {
+        let rows = &mut self.snapshot.dns;
+        self.dns_pending
+            .retain(|(_, _, _, query_type, _), pending| {
+                if through.saturating_sub(pending.last) < 120_000 {
+                    return true;
+                }
+                rows.push(DnsQuery {
+                    id: rows.len() as u64 + 1,
+                    at: pending.last,
+                    process: pending.process.clone(),
+                    name: pending.name.clone(),
+                    query_type: *query_type,
+                    status: None,
+                    results: String::new(),
+                    duration_ms: None,
+                    source: "Microsoft-Windows-DNS-Client / 3006".into(),
+                    request_at: Some(pending.last),
+                });
+                false
+            });
+    }
+
     pub fn tick(&mut self, at: i64) {
         self.collect_wire_dns(at);
+        self.collect_unanswered_dns(at);
         let idle = self
             .snapshot
             .recording
@@ -484,12 +526,11 @@ impl Engine {
                 .ended
                 .is_none_or(|end| at - end < 2000)
         });
-        self.dns_pending
-            .retain(|_, v| v.last().is_some_and(|t| at - t < 120_000));
     }
 
     pub fn finish(&mut self) {
         self.collect_wire_dns(i64::MAX);
+        self.collect_unanswered_dns(i64::MAX);
         let at = now_ms();
         self.snapshot.running = false;
         self.snapshot.recording.as_mut().unwrap().ended = Some(at);
@@ -751,5 +792,49 @@ mod tests {
             });
         }
         assert_eq!(e.snapshot.dns[0].duration_ms, None);
+    }
+
+    #[test]
+    fn system_dns_preserves_unanswered_questions_at_stop() {
+        let mut e = engine();
+        for (name, at, completed) in [
+            ("answered.test", 100, false),
+            ("unanswered.test", 101, false),
+            ("answered.test", 125, true),
+        ] {
+            e.apply(Event::Dns {
+                at,
+                pid: 42,
+                name: name.into(),
+                query_type: 1,
+                status: 0,
+                results: if completed {
+                    "192.0.2.10".into()
+                } else {
+                    String::new()
+                },
+                activity: 1,
+                completed,
+            });
+        }
+        assert_eq!(e.snapshot.dns.len(), 1);
+        e.finish();
+        e.finish();
+        assert_eq!(e.snapshot.dns.len(), 2);
+        let answered = &e.snapshot.dns[0];
+        assert_eq!(answered.query_time(), Some(100));
+        assert_eq!(answered.status, Some(0));
+        assert_eq!(answered.results, "192.0.2.10");
+        let no_reply = &e.snapshot.dns[1];
+        assert_eq!(no_reply.question(), "unanswered.test · A");
+        assert_eq!(no_reply.query_time(), Some(101));
+        assert_eq!(no_reply.status, None);
+        assert!(no_reply.results.is_empty());
+
+        let mut old_row = serde_json::to_value(answered).unwrap();
+        old_row.as_object_mut().unwrap().remove("request_at");
+        let decoded: DnsQuery = serde_json::from_value(old_row).unwrap();
+        assert_eq!(decoded.query_time(), Some(100));
+        assert_eq!(decoded.status, Some(0));
     }
 }

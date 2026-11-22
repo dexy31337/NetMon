@@ -17,6 +17,7 @@ use std::{
 pub(super) struct FlowFilter {
     pub(super) protocol: Option<Protocol>,
     pub(super) only_errors: bool,
+    pub(super) only_sent: bool,
     pub(super) hide_loopback: bool,
 }
 
@@ -25,8 +26,13 @@ impl FlowFilter {
         self.protocol
             .is_none_or(|protocol| flow.protocol == protocol)
             && (!self.only_errors || flow.outcome == Outcome::Failed)
+            && (!self.only_sent || is_only_sent(flow))
             && (!self.hide_loopback || !flow.remote.ip().is_loopback())
     }
+}
+
+fn is_only_sent(flow: &Flow) -> bool {
+    flow.protocol == Protocol::Udp && flow.sent_events > 0 && flow.received_events == 0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,7 +95,7 @@ impl<'a> DnsCandidates<'a> {
     pub(super) fn new(queries: &'a [DnsQuery]) -> Self {
         // Only successful answers from the same process instance can suggest a name.
         let mut candidates = Self::default();
-        for query in queries.iter().filter(|query| query.status == 0) {
+        for query in queries.iter().filter(|query| query.status == Some(0)) {
             for token in query.results.split([';', ' ', '\t', '\r', '\n']) {
                 if let Ok(ip) = token.parse::<IpAddr>() {
                     candidates
@@ -140,6 +146,7 @@ struct ServerStats {
     processes: BTreeSet<String>,
     names: BTreeSet<String>,
     connections: usize,
+    only_sent: usize,
     failed: usize,
     sent: u64,
     received: u64,
@@ -156,6 +163,7 @@ impl ServerStats {
             }
         }
         self.connections += 1;
+        self.only_sent += usize::from(is_only_sent(flow));
         self.failed += usize::from(flow.outcome == Outcome::Failed);
         self.sent += flow.sent;
         self.received += flow.received;
@@ -265,6 +273,7 @@ impl App {
                 .column(Column::initial(160.0))
                 .column(Column::initial(140.0))
                 .column(Column::initial(60.0))
+                .column(Column::initial(105.0))
                 .column(Column::initial(60.0))
                 .column(Column::initial(85.0))
                 .column(Column::initial(85.0))
@@ -274,6 +283,7 @@ impl App {
                         "Возможные DNS-имена",
                         "Приложения",
                         "Сессии",
+                        "Только отправка",
                         "Ошибки",
                         "Отправлено",
                         "Получено",
@@ -343,6 +353,14 @@ impl App {
                             row.col(|ui| summary_list(ui, &stats.processes, INK_DIM));
                             row.col(|ui| {
                                 ui.label(mono(stats.connections.to_string()).color(INK));
+                            });
+                            row.col(|ui| {
+                                let color = if stats.only_sent > 0 {
+                                    NEON_SOFT
+                                } else {
+                                    INK_FAINT
+                                };
+                                ui.label(mono(stats.only_sent.to_string()).color(color));
                             });
                             row.col(|ui| {
                                 let color = if stats.failed > 0 { PULSE } else { INK_FAINT };
@@ -455,10 +473,11 @@ mod tests {
             process: flows[0].process.clone(),
             name: "match.example".into(),
             query_type: 1,
-            status: 0,
+            status: Some(0),
             results: "192.0.2.1".into(),
             duration_ms: None,
             source: String::new(),
+            request_at: None,
         };
         let mut unrelated = query.clone();
         unrelated.process.started += 1;
@@ -467,7 +486,7 @@ mod tests {
         too_old.at = flows[0].first - 300_001;
         too_old.name = "old.example".into();
         let mut failed = query.clone();
-        failed.status = 9003;
+        failed.status = Some(9003);
         failed.name = "failed.example".into();
         let snapshot = Snapshot {
             flows,
@@ -480,6 +499,7 @@ mod tests {
         let server = &servers[0];
         assert_eq!(server.ip.to_string(), "192.0.2.1");
         assert_eq!(server.total.connections, 4);
+        assert_eq!(server.total.only_sent, 0);
         assert_eq!(server.total.failed, 1);
         assert_eq!(server.total.sent, 35);
         assert_eq!(server.total.received, 85);
@@ -516,6 +536,7 @@ mod tests {
             FlowFilter {
                 protocol: Some(Protocol::Tcp),
                 only_errors: true,
+                only_sent: false,
                 hide_loopback: true,
             },
             "match.example",
@@ -532,6 +553,40 @@ mod tests {
             "",
         );
         assert_eq!(without_loopback.len(), 2);
+    }
+
+    #[test]
+    fn only_sent_filter_uses_udp_direction_and_filters_server_aggregates() {
+        let mut both = flow("192.0.2.1:443", Protocol::Udp, Outcome::Datagram, 10, 20);
+        both.sent_events = 1;
+        both.received_events = 1;
+        let mut only_sent = flow("192.0.2.1:443", Protocol::Udp, Outcome::Datagram, 30, 0);
+        only_sent.sent_events = 2;
+        let tcp = flow("192.0.2.1:443", Protocol::Tcp, Outcome::Established, 40, 0);
+        let snapshot = Snapshot {
+            flows: vec![both, only_sent, tcp],
+            ..Default::default()
+        };
+
+        let unfiltered = summarize_servers(&snapshot, FlowFilter::default(), "");
+        assert_eq!(unfiltered[0].total.connections, 3);
+        assert_eq!(unfiltered[0].total.only_sent, 1);
+
+        let filtered = summarize_servers(
+            &snapshot,
+            FlowFilter {
+                only_sent: true,
+                ..Default::default()
+            },
+            "",
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].total.connections, 1);
+        assert_eq!(filtered[0].total.only_sent, 1);
+        assert_eq!(filtered[0].total.sent, 30);
+        assert_eq!(filtered[0].total.received, 0);
+        assert_eq!(filtered[0].ports.len(), 1);
+        assert_eq!(filtered[0].ports[0].0.protocol, Protocol::Udp);
     }
 
     #[test]

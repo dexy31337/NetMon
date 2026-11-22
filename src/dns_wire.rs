@@ -14,6 +14,23 @@ pub struct Question {
     rr_type: u16,
 }
 
+impl Question {
+    fn unanswered(&self, at: i64) -> DnsQuery {
+        DnsQuery {
+            id: 0,
+            at,
+            process: ProcessInfo::default(),
+            name: self.name.clone(),
+            query_type: self.rr_type as u32,
+            status: None,
+            results: String::new(),
+            duration_ms: None,
+            source: format!("{UDP_DNS_SOURCE}{} · Kernel ETW", self.server),
+            request_at: Some(at),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Datagram {
     question: Question,
@@ -268,11 +285,13 @@ impl Tracker {
                 .next()
                 .filter(|first| first.1 != 0 && owners.all(|other| other == *first));
             if let Some((status, results)) = packet.answer {
-                if let Some(request) = self.pending.remove(&q)
+                if let Some(request) = self.pending.get(&q)
                     && let Some(client) = request.owner
                     && Some(client) == owner
                     && (0..=REPLY_MS).contains(&(at - request.at))
                 {
+                    let request_at = (!request.repeated).then_some(request.at);
+                    self.pending.remove(&q);
                     emit(
                         client,
                         DnsQuery {
@@ -281,14 +300,24 @@ impl Tracker {
                             process: ProcessInfo::default(),
                             name: q.name,
                             query_type: q.rr_type as u32,
-                            status,
+                            status: Some(status),
                             results,
-                            duration_ms: (!request.repeated).then_some(at - request.at),
+                            duration_ms: request_at.map(|start| at - start),
                             source: format!("{UDP_DNS_SOURCE}{} · Kernel ETW", q.server),
+                            request_at,
                         },
                     );
                 }
             } else {
+                if self
+                    .pending
+                    .get(&q)
+                    .is_some_and(|old| at - old.at > REPLY_MS)
+                    && let Some(expired) = self.pending.remove(&q)
+                    && let Some(owner) = expired.owner
+                {
+                    emit(owner, q.unanswered(expired.at));
+                }
                 let fresh = Pending {
                     at,
                     owner,
@@ -297,22 +326,25 @@ impl Tracker {
                 self.pending
                     .entry(q)
                     .and_modify(|last| {
-                        if at - last.at > REPLY_MS {
-                            last.owner = owner;
-                            last.repeated = false;
-                        } else {
-                            // Do not invent a duration for a retransmitted question.
-                            last.repeated = true;
-                            if last.owner != owner {
-                                last.owner = None;
-                            }
+                        // Do not invent a duration for a retransmitted question.
+                        last.repeated = true;
+                        if last.owner != owner {
+                            last.owner = None;
                         }
                         last.at = at;
                     })
                     .or_insert(fresh);
             }
         }
-        self.pending.retain(|_, p| ready - p.at <= REPLY_MS);
+        self.pending.retain(|question, pending| {
+            if ready.saturating_sub(pending.at) <= REPLY_MS {
+                return true;
+            }
+            if let Some(owner) = pending.owner {
+                emit(owner, question.unanswered(pending.at));
+            }
+            false
+        });
         self.kernel_count = 0;
         self.kernel.retain(|_, events| {
             events.retain(|(at, _)| *at >= ready - MATCH_MS);
@@ -415,12 +447,12 @@ mod tests {
             started: 25,
             ..Default::default()
         };
-        for (other_client, other_id, too_late, shared_port, expected) in [
-            (false, false, false, false, 1),
-            (true, false, false, false, 0),
-            (false, true, false, false, 0),
-            (false, false, true, false, 0),
-            (false, false, false, true, 0),
+        for (other_client, other_id, too_late, shared_port, expected_duration) in [
+            (false, false, false, false, Some(20)),
+            (true, false, false, false, None),
+            (false, true, false, false, None),
+            (false, false, true, false, None),
+            (false, false, false, true, None),
         ] {
             let mut tracker = Tracker::default();
             observe(&mut tracker, false, 5, 10, &a);
@@ -445,10 +477,12 @@ mod tests {
             let mut count = 0;
             tracker.drain(i64::MAX, |owner, d| {
                 assert_eq!(owner, (a.pid, a.started));
-                assert_eq!(d.duration_ms, Some(20));
+                assert_eq!(d.duration_ms, expected_duration);
+                assert_eq!(d.status, expected_duration.map(|_| 0));
+                assert_eq!(d.request_at, Some(10));
                 count += 1;
             });
-            assert_eq!(count, expected);
+            assert_eq!(count, usize::from(!shared_port));
         }
         let mut tracker = Tracker::default();
         observe(&mut tracker, true, 5, 100, &a);

@@ -90,16 +90,30 @@ pub struct DnsQuery {
     pub process: ProcessInfo,
     pub name: String,
     pub query_type: u32,
-    pub status: u32,
+    pub status: Option<u32>,
     pub results: String,
     pub duration_ms: Option<i64>,
     pub source: String,
+    #[serde(default)]
+    pub request_at: Option<i64>,
 }
 pub const UDP_DNS_SOURCE: &str = "UDP/53 · ";
 impl DnsQuery {
+    pub fn question(&self) -> String {
+        format!("{} · {}", self.name, dns_type(self.query_type))
+    }
+
+    pub fn query_time(&self) -> Option<i64> {
+        self.request_at
+            .or_else(|| self.duration_ms.and_then(|ms| self.at.checked_sub(ms)))
+    }
+
     pub fn status_label(&self) -> String {
+        let Some(status) = self.status else {
+            return "Ответ не наблюдался".into();
+        };
         if self.source.starts_with(UDP_DNS_SOURCE) {
-            return match self.status {
+            return match status {
                 0 => "OK".into(),
                 1 => "FORMERR".into(),
                 2 => "SERVFAIL".into(),
@@ -109,7 +123,7 @@ impl DnsQuery {
                 code => format!("RCODE {code}"),
             };
         }
-        dns_status(self.status)
+        dns_status(status)
     }
 }
 pub fn dns_type(t: u32) -> String {

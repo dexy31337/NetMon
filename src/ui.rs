@@ -8,7 +8,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
-use instruments::{Overview, idle_chip, nav_icon, share_meter};
+use instruments::{Overview, idle_chip, nav_icon, share_meter, summary_strip};
 use serde::{Deserialize, Serialize};
 use servers::{DnsCandidates, FlowFilter, ServerTarget, Servers, flow_search_matches};
 use std::{
@@ -370,6 +370,8 @@ struct Settings {
     label: String,
     children: bool,
     udp_idle: u64,
+    #[serde(default)]
+    record_history: bool,
     presets: Vec<CaptureConfig>,
 }
 impl Default for Settings {
@@ -379,8 +381,59 @@ impl Default for Settings {
             label: "Наблюдение".into(),
             children: true,
             udp_idle: 30,
+            record_history: false,
             presets: vec![],
         }
+    }
+}
+
+impl Settings {
+    fn preset(&self, name: &str) -> Option<&CaptureConfig> {
+        self.presets.iter().find(|preset| preset.label == name)
+    }
+
+    fn preset_matches(&self, name: &str) -> bool {
+        self.preset(name).is_some_and(|preset| {
+            preset.exe_filters == self.filters
+                && preset.include_children == self.children
+                && preset.udp_idle_seconds == self.udp_idle
+        })
+    }
+
+    fn load_preset(&mut self, name: &str) -> bool {
+        let Some(preset) = self.preset(name).cloned() else {
+            return false;
+        };
+        self.filters = preset.exe_filters;
+        self.children = preset.include_children;
+        self.udp_idle = preset.udp_idle_seconds;
+        true
+    }
+
+    fn save_preset(&mut self, name: &str) -> bool {
+        let preset = CaptureConfig {
+            exe_filters: self.filters.clone(),
+            include_children: self.children,
+            udp_idle_seconds: self.udp_idle,
+            // CaptureConfig is retained for settings.json compatibility; here label is the set name.
+            label: name.to_owned(),
+        };
+        if let Some(existing) = self.presets.iter_mut().find(|item| item.label == name) {
+            *existing = preset;
+            true
+        } else {
+            self.presets.push(preset);
+            false
+        }
+    }
+}
+
+fn compact_preset_name(name: &str) -> String {
+    const MAX: usize = 28;
+    if name.chars().count() <= MAX {
+        name.to_owned()
+    } else {
+        format!("{}…", name.chars().take(MAX - 1).collect::<String>())
     }
 }
 
@@ -408,6 +461,7 @@ struct App {
     dir: PathBuf,
     settings: Settings,
     capture: Option<CaptureTask>,
+    capture_records_history: bool,
     live: Arc<Snapshot>,
     viewing: Option<Arc<Snapshot>>,
     tab: usize,
@@ -415,12 +469,16 @@ struct App {
     server_drilldown: Option<ServerTarget>,
     protocol: usize,
     only_errors: bool,
+    only_sent: bool,
     hide_loopback: bool,
     message: String,
     history: Vec<Recording>,
     active_history: std::collections::HashSet<String>,
     pending_history_delete: Option<String>,
     process_picker: ProcessPicker,
+    selected_preset: Option<String>,
+    preset_name: String,
+    show_save_preset: bool,
     selected_flow: Option<u64>,
     selected_dns: Option<u64>,
     stopping: bool,
@@ -448,9 +506,7 @@ pub fn run() -> eframe::Result {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
-            let mut app = App::new(dir, settings);
-            app.refresh_history();
-            Ok(Box::new(app))
+            Ok(Box::new(App::new(dir, settings)))
         }),
     )
 }
@@ -461,6 +517,7 @@ impl App {
             dir,
             settings,
             capture: None,
+            capture_records_history: false,
             live: Arc::new(Snapshot::default()),
             viewing: None,
             tab: 0,
@@ -468,12 +525,16 @@ impl App {
             server_drilldown: None,
             protocol: 0,
             only_errors: false,
+            only_sent: false,
             hide_loopback: false,
             message: String::new(),
             history: vec![],
             active_history: std::collections::HashSet::new(),
             pending_history_delete: None,
             process_picker: ProcessPicker::default(),
+            selected_preset: None,
+            preset_name: String::new(),
+            show_save_preset: false,
             selected_flow: None,
             selected_dns: None,
             stopping: false,
@@ -485,7 +546,7 @@ impl App {
     }
 
     fn busy(&self) -> bool {
-        self.capture.as_ref().is_some_and(|c| !c.finished())
+        self.capture.is_some()
     }
     fn snapshot(&self) -> Arc<Snapshot> {
         self.viewing.as_ref().unwrap_or(&self.live).clone()
@@ -512,11 +573,12 @@ impl App {
         }
     }
     fn refresh_history(&mut self) {
-        match Store::open(&self.dir).and_then(|s| s.list()) {
+        match Store::list_existing(&self.dir) {
             Ok(h) => {
                 let current_recording_id = self
                     .capture
                     .as_ref()
+                    .filter(|_| self.capture_records_history)
                     .and_then(|_| self.live.recording.as_ref())
                     .map(|r| r.id.as_str());
                 self.active_history = storage::active_recording_ids(&h, current_recording_id);
@@ -534,6 +596,7 @@ impl App {
         let current_id = self
             .capture
             .as_ref()
+            .filter(|_| self.capture_records_history)
             .and_then(|_| self.live.recording.as_ref())
             .map(|r| r.id.as_str());
         match Store::open(&self.dir).and_then(|mut store| store.delete(id, current_id)) {
@@ -576,16 +639,22 @@ impl App {
 
     fn start(&mut self) {
         if !collector::is_elevated() {
-            self.message = "Для записи запустите NetMon от имени администратора. История доступна без повышения прав.".into();
+            self.message = "Для мониторинга запустите NetMon от имени администратора. История доступна без повышения прав.".into();
             return;
         }
         let config = self.config();
         if config.exe_filters.is_empty() {
-            self.message = "Выберите хотя бы одно приложение для записи.".into();
+            self.message = "Выберите хотя бы одно приложение для мониторинга.".into();
             return;
         }
+        self.message.clear();
         self.save_settings();
-        self.capture = Some(CaptureTask::start(config, self.dir.clone()));
+        self.capture_records_history = self.settings.record_history;
+        self.capture = Some(if self.capture_records_history {
+            CaptureTask::start(config, self.dir.clone())
+        } else {
+            CaptureTask::start_live(config)
+        });
         self.live = Arc::new(Snapshot::default());
         self.viewing = None;
         self.server_drilldown = None;
@@ -593,7 +662,6 @@ impl App {
         self.stopping = false;
         self.selected_flow = None;
         self.selected_dns = None;
-        self.message.clear();
         if self.tab == 3 {
             self.tab = 0;
         }
@@ -630,17 +698,17 @@ impl App {
                     ui.add_space(24.0);
                     ui.separator();
                     ui.add_space(12.0);
-                    ui.label(caption("НОВАЯ ЗАПИСЬ").color(NEON_SOFT));
+                    ui.label(caption("НАСТРОЙКИ МОНИТОРИНГА").color(NEON_SOFT));
                     ui.add_space(4.0);
                     ui.add_enabled_ui(!busy, |ui| {
-                        ui.label(RichText::new("Название / группа").small().color(INK_DIM));
+                        ui.label(RichText::new("Название записи").small().color(INK_DIM));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.settings.label)
                                 .desired_width(204.0),
                         );
                         self.process_picker.show(ui, &mut self.settings.filters);
                         ui.checkbox(&mut self.settings.children, "Включать дочерние процессы")
-                            .on_hover_text("Записывать также процессы, запущенные выбранными приложениями, и их потомков.");
+                            .on_hover_text("Отслеживать также процессы, запущенные выбранными приложениями, и их потомков.");
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Пауза UDP").color(INK_DIM));
                             ui.add(
@@ -649,43 +717,86 @@ impl App {
                                     .suffix(" с"),
                             );
                         });
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Сохранить группу").clicked() {
-                                let config = self.config();
-                                if !config.exe_filters.is_empty() {
-                                    self.settings.presets.retain(|p| p.label != config.label);
-                                    self.settings.presets.push(config);
-                                    self.save_settings();
-                                }
-                            }
-                            ui.menu_button("Группы", |ui| {
-                                for p in self.settings.presets.clone() {
-                                    if ui.button(&p.label).clicked() {
-                                        self.settings.filters = p.exe_filters;
-                                        self.settings.label = p.label;
-                                        self.settings.children = p.include_children;
-                                        self.settings.udp_idle = p.udp_idle_seconds;
-                                        ui.close_menu();
+                        if self.selected_preset.as_ref().is_some_and(|name| {
+                            !self.settings.preset_matches(name)
+                        }) {
+                            self.selected_preset = None;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(caption("НАБОРЫ ПРИЛОЖЕНИЙ").color(NEON_SOFT));
+                        let selected_text = self
+                            .selected_preset
+                            .as_deref()
+                            .map(compact_preset_name)
+                            .unwrap_or_else(|| "Выбрать сохранённый набор…".into());
+                        egui::ComboBox::from_id_salt("application-presets")
+                            .selected_text(selected_text)
+                            .width(204.0)
+                            .show_ui(ui, |ui| {
+                                if self.settings.presets.is_empty() {
+                                    ui.label("Сохранённых наборов пока нет");
+                                } else {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_preset.is_none(),
+                                            "Очистить выбор набора",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_preset = None;
+                                    }
+                                    ui.separator();
+                                    for name in self
+                                        .settings
+                                        .presets
+                                        .iter()
+                                        .map(|preset| preset.label.clone())
+                                        .collect::<Vec<_>>()
+                                    {
+                                        if ui
+                                            .selectable_label(
+                                                self.selected_preset.as_deref()
+                                                    == Some(name.as_str()),
+                                                compact_preset_name(&name),
+                                            )
+                                            .on_hover_text(&name)
+                                            .clicked()
+                                        {
+                                            self.settings.load_preset(&name);
+                                            self.selected_preset = Some(name);
+                                            self.save_settings();
+                                        }
                                     }
                                 }
-                                if self.settings.presets.is_empty() {
-                                    ui.label("Нет сохранённых групп");
-                                }
                             });
-                        });
+                        if ui.small_button("Сохранить набор…").clicked() {
+                            self.preset_name = self.selected_preset.clone().unwrap_or_default();
+                            self.show_save_preset = true;
+                        }
                     });
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::Checkbox::new(&mut self.settings.record_history, "Записывать в историю"),
+                        )
+                        .on_hover_text("Добавляет сессию в локальную историю. Без флажка результат остаётся в памяти до следующего запуска мониторинга.")
+                        .changed()
+                    {
+                        self.save_settings();
+                    }
                     ui.add_space(16.0);
                     let size = egui::vec2(ui.available_width(), 44.0);
                     if busy && self.stopping {
                         ui.add_enabled(
                             false,
                             egui::Button::new(
-                                display("СОХРАНЕНИЕ…", 16.0).extra_letter_spacing(2.0),
+                                display("Остановка…", 15.0),
                             )
                             .min_size(size),
                         );
                     } else if busy {
-                        let text = display("      ОСТАНОВИТЬ", 16.0).extra_letter_spacing(2.0);
+                        let text = display("      Остановить мониторинг", 15.0);
                         let stop = lit(ui, PULSE, |ui| {
                             ui.add(
                                 egui::Button::new(text.clone().color(PULSE))
@@ -709,7 +820,7 @@ impl App {
                             self.stopping = true;
                         }
                     } else {
-                        let text = display("      НАЧАТЬ ЗАПИСЬ", 16.0).extra_letter_spacing(2.0);
+                        let text = display("      Начать мониторинг", 15.0);
                         let start = lit(ui, NEON, |ui| {
                             ui.add(
                                 egui::Button::new(text.clone().color(VOID))
@@ -726,7 +837,7 @@ impl App {
                     }
                     ui.add_space(18.0);
                     let (dot, text) = if collector::is_elevated() {
-                        (NEON, "ADMIN · ЗАПИСЬ ДОСТУПНА")
+                        (NEON, "ADMIN · МОНИТОРИНГ ДОСТУПЕН")
                     } else {
                         (AMBER, "ТОЛЬКО ПРОСМОТР ИСТОРИИ")
                     };
@@ -738,14 +849,68 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(
-                            "Данные сохраняются локально.\nСодержимое пакетов не записывается.",
-                        )
-                        .small()
-                        .color(INK_FAINT),
+                        RichText::new("Содержимое пакетов не записывается.")
+                            .small()
+                            .color(INK_FAINT),
                     );
                 });
             });
+        if self.show_save_preset {
+            let mut save = false;
+            let mut cancel = false;
+            let normalized_name = self.preset_name.trim().to_owned();
+            let overwrites =
+                !normalized_name.is_empty() && self.settings.preset(&normalized_name).is_some();
+            let modal =
+                egui::Modal::new(egui::Id::new("save-application-preset")).show(ctx, |ui| {
+                    ui.set_max_width(320.0);
+                    ui.label(display("Сохранить набор приложений", 21.0).color(INK));
+                    ui.add_space(6.0);
+                    ui.label("Название набора");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preset_name)
+                            .hint_text("Например, Игры")
+                            .desired_width(260.0),
+                    );
+                    if self.settings.filters.is_empty() {
+                        ui.label(RichText::new("Сначала выберите приложения.").color(AMBER));
+                    } else if overwrites {
+                        ui.label(
+                            RichText::new("Набор с таким именем уже существует.").color(AMBER),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        let verb = if overwrites {
+                            "Перезаписать набор"
+                        } else {
+                            "Сохранить набор"
+                        };
+                        save = ui
+                            .add_enabled(
+                                !normalized_name.is_empty() && !self.settings.filters.is_empty(),
+                                egui::Button::new(verb),
+                            )
+                            .clicked();
+                        if ui.button("Отмена").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            cancel |= modal.should_close();
+            if save {
+                let name = self.preset_name.trim().to_owned();
+                let overwritten = self.settings.save_preset(&name);
+                self.selected_preset = Some(name.clone());
+                self.save_settings();
+                self.message = if overwritten {
+                    format!("Набор «{name}» перезаписан.")
+                } else {
+                    format!("Набор «{name}» сохранён.")
+                };
+                cancel = true;
+            }
+            self.show_save_preset = !cancel;
+        }
     }
 
     fn top(&mut self, ui: &mut egui::Ui, s: &Arc<Snapshot>) {
@@ -776,12 +941,24 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (text, color, live) = if self.viewing.is_some() {
                     ("АРХИВ", RX, false)
-                } else if self.stopping && self.busy() {
-                    ("СОХРАНЕНИЕ", AMBER, false)
+                } else if self.stopping {
+                    if self.capture_records_history {
+                        ("ОСТАНОВКА И СОХРАНЕНИЕ", AMBER, false)
+                    } else {
+                        ("ОСТАНОВКА", AMBER, false)
+                    }
                 } else if self.busy() {
-                    ("REC · ЗАПИСЬ", NEON, true)
+                    if self.capture_records_history {
+                        ("МОНИТОРИНГ · В ИСТОРИЮ", NEON, true)
+                    } else {
+                        ("МОНИТОРИНГ · БЕЗ ИСТОРИИ", NEON, true)
+                    }
                 } else if s.recording.as_ref().is_some_and(|r| r.ended.is_some()) {
-                    ("ЗАВЕРШЕНО", INK_DIM, false)
+                    if self.capture_records_history {
+                        ("ЗАВЕРШЕНО", INK_DIM, false)
+                    } else {
+                        ("ЗАВЕРШЕНО · В ПАМЯТИ", INK_DIM, false)
+                    }
                 } else {
                     ("ОЖИДАНИЕ", INK_FAINT, false)
                 };
@@ -796,40 +973,59 @@ impl App {
             }
             let totals = &self.overview;
             let volume = totals.sent.saturating_add(totals.received);
-            ui.columns(4, |cols| {
-                metric(
-                    &mut cols[0],
-                    "СОЕДИНЕНИЯ",
+            if ui.available_width() >= 720.0 {
+                let share = |part: u64| {
+                    if volume == 0 {
+                        "доля —".to_owned()
+                    } else {
+                        format!("{:.0}%", 100.0 * part as f64 / volume as f64)
+                    }
+                };
+                summary_strip(
+                    ui,
                     &s.flows.len().to_string(),
-                    INK,
-                    |ui| {
-                        metric_errors(ui, totals.failed, s.flows.len());
-                    },
-                );
-                metric(
-                    &mut cols[1],
-                    "↑ TX · ОТПРАВЛЕНО",
+                    totals.failed,
                     &bytes(totals.sent),
-                    NEON,
-                    |ui| share_meter(ui, totals.sent, volume, NEON),
-                );
-                metric(
-                    &mut cols[2],
-                    "↓ RX · ПОЛУЧЕНО",
+                    &share(totals.sent),
                     &bytes(totals.received),
-                    RX,
-                    |ui| share_meter(ui, totals.received, volume, RX),
-                );
-                metric(
-                    &mut cols[3],
-                    "DNS-ЗАПРОСЫ",
+                    &share(totals.received),
                     &s.dns.len().to_string(),
-                    INK,
-                    |ui| {
-                        metric_errors(ui, totals.dns_failed, s.dns.len());
-                    },
+                    totals.dns_failed,
                 );
-            });
+            } else {
+                ui.columns(2, |cols| {
+                    metric(
+                        &mut cols[0],
+                        "СОЕДИНЕНИЯ",
+                        &s.flows.len().to_string(),
+                        INK,
+                        |ui| metric_errors(ui, totals.failed, s.flows.len()),
+                    );
+                    metric(
+                        &mut cols[1],
+                        "DNS-ЗАПРОСЫ",
+                        &s.dns.len().to_string(),
+                        INK,
+                        |ui| metric_errors(ui, totals.dns_failed, s.dns.len()),
+                    );
+                });
+                ui.columns(2, |cols| {
+                    metric(
+                        &mut cols[0],
+                        "↑ TX · ОТПРАВЛЕНО",
+                        &bytes(totals.sent),
+                        NEON,
+                        |ui| share_meter(ui, totals.sent, volume, NEON),
+                    );
+                    metric(
+                        &mut cols[1],
+                        "↓ RX · ПОЛУЧЕНО",
+                        &bytes(totals.received),
+                        RX,
+                        |ui| share_meter(ui, totals.received, volume, RX),
+                    );
+                });
+            }
             totals.timeline(ui);
             ui.add_space(6.0);
         }
@@ -844,7 +1040,7 @@ impl App {
                     ))
                     .color(INK_DIM),
                 );
-                if self.viewing.is_some() && ui.small_button("К текущей записи").clicked()
+                if self.viewing.is_some() && ui.small_button("К текущему мониторингу").clicked()
                 {
                     self.viewing = None;
                     self.server_drilldown = None;
@@ -904,6 +1100,8 @@ impl App {
                         }
                     });
                 ui.checkbox(&mut self.hide_loopback, "Без loopback");
+                ui.checkbox(&mut self.only_sent, "Только отправка")
+                    .on_hover_text("UDP-сессии, где наблюдалась отправка, но не приём");
             }
             ui.checkbox(&mut self.only_errors, "Ошибки");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -937,6 +1135,7 @@ impl App {
                 _ => None,
             },
             only_errors: self.only_errors,
+            only_sent: self.only_sent,
             hide_loopback: self.hide_loopback,
         }
     }
@@ -964,7 +1163,7 @@ impl App {
                 ui,
                 s,
                 "Соединений пока нет",
-                "Запустите запись, затем откройте игру или лаунчер.",
+                "Запустите мониторинг, затем откройте игру или лаунчер.",
             );
             return;
         }
@@ -1060,23 +1259,28 @@ impl App {
 
     fn dns(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let query = self.search.to_lowercase();
-        let rows: Vec<_> = s
+        let mut rows: Vec<_> = s
             .dns
             .iter()
-            .rev()
             .filter(|d| {
-                (!self.only_errors || d.status != 0)
+                (!self.only_errors || d.status.is_some_and(|status| status != 0))
                     && (query.is_empty()
-                        || format!("{} {} {}", d.name, d.process.exe, d.results)
-                            .to_lowercase()
-                            .contains(&query))
+                        || format!(
+                            "{} {} {} {}",
+                            d.question(),
+                            d.process.exe,
+                            d.results,
+                            d.source
+                        )
+                        .to_lowercase()
+                        .contains(&query))
             })
             .collect();
         if rows.is_empty() {
             let (title, hint) = if s.dns.is_empty() {
                 (
-                    "Результатов DNS пока нет",
-                    "Запишите запуск приложения. Здесь появятся результаты DNS-клиента Windows и подтверждённые пары запрос–ответ по UDP/53 через IPv4. При собственном DoH, DoT или обращении по готовому IP имён может не быть.",
+                    "Событий DNS пока нет",
+                    "Запустите мониторинг до запуска приложения. Здесь появятся запросы и ответы DNS-клиента Windows и прямого UDP/53 через IPv4. Запросы без наблюдаемого ответа появятся после ожидания или остановки.",
                 )
             } else {
                 (
@@ -1087,7 +1291,7 @@ impl App {
             empty(ui, s, title, hint);
             return;
         }
-        ui.label(RichText::new("Результаты DNS-клиента Windows и завершённые обмены по UDP/53 через IPv4. Источник указан в карточке запроса.").small().color(INK_FAINT));
+        rows.sort_by_key(|d| std::cmp::Reverse((d.query_time().unwrap_or(d.at), d.id)));
         egui::ScrollArea::horizontal().show(ui, |ui| {
             TableBuilder::new(ui)
                 .id_salt("dns-table")
@@ -1097,17 +1301,15 @@ impl App {
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::initial(82.0))
                 .column(Column::initial(165.0))
-                .column(Column::initial(235.0))
-                .column(Column::initial(50.0))
-                .column(Column::initial(110.0))
+                .column(Column::initial(250.0))
+                .column(Column::initial(160.0))
                 .column(Column::initial(300.0))
                 .column(Column::initial(70.0))
                 .header(28.0, |mut h| {
                     for name in [
                         "Время",
                         "Приложение",
-                        "Имя",
-                        "Тип",
+                        "Запрос",
                         "Результат",
                         "Ответ",
                         "Время, мс",
@@ -1120,35 +1322,35 @@ impl App {
                         let d = rows[row.index()];
                         row.set_selected(self.selected_dns == Some(d.id));
                         row.col(|ui| {
-                            ui.label(mono(time(d.at)).color(INK_FAINT));
+                            ui.label(mono(time(d.query_time().unwrap_or(d.at))).color(INK_FAINT))
+                                .on_hover_text(if d.query_time().is_some() {
+                                    "Время запроса"
+                                } else {
+                                    "Время результата"
+                                });
                         });
                         row.col(|ui| {
                             ui.label(&d.process.exe);
                         });
                         row.col(|ui| {
-                            ui.label(RichText::new(&d.name).color(INK));
+                            let question = d.question();
+                            ui.label(mono(&question).color(INK)).on_hover_text(question);
                         });
                         row.col(|ui| {
-                            ui.label(mono(dns_type(d.query_type)).color(INK_DIM));
+                            let color = match d.status {
+                                Some(0) => NEON,
+                                Some(_) => PULSE,
+                                None => INK_DIM,
+                            };
+                            ui.label(mono(d.status_label()).color(color));
                         });
                         row.col(|ui| {
-                            let ok = d.status == 0;
-                            ui.label(
-                                mono(format!(
-                                    "{} {}",
-                                    if ok { "●" } else { "×" },
-                                    d.status_label()
-                                ))
-                                .color(if ok {
-                                    NEON
-                                } else {
-                                    PULSE
-                                }),
-                            );
-                        });
-                        row.col(|ui| {
-                            ui.label(mono(&d.results).color(INK_DIM))
-                                .on_hover_text(&d.results);
+                            let answer = if d.results.is_empty() {
+                                "—"
+                            } else {
+                                &d.results
+                            };
+                            ui.label(mono(answer).color(INK_DIM)).on_hover_text(answer);
                         });
                         row.col(|ui| {
                             ui.label(
@@ -1178,7 +1380,7 @@ impl App {
         ui.add_space(12.0);
         if self.history.is_empty() {
             ui.label(
-                RichText::new("Сохранённые записи появятся после первого запуска мониторинга.")
+                RichText::new("Включите «Записывать в историю» перед запуском мониторинга.")
                     .color(INK_DIM),
             );
             return;
@@ -1398,15 +1600,9 @@ impl App {
                 .open(&mut open)
                 .default_width(620.0)
                 .show(ctx, |ui| {
-                    ui.label(display(&d.name, 20.0).color(INK));
+                    ui.label(display(d.question(), 20.0).color(INK));
                     ui.label(
-                        mono(format!(
-                            "{} · PID {} · {}",
-                            d.process.exe,
-                            d.process.pid,
-                            timestamp(d.at)
-                        ))
-                        .color(INK_DIM),
+                        mono(format!("{} · PID {}", d.process.exe, d.process.pid)).color(INK_DIM),
                     );
                     ui.add_space(4.0);
                     ui.separator();
@@ -1414,17 +1610,33 @@ impl App {
                         .num_columns(2)
                         .spacing([18.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label(caption("ТИП"));
-                            ui.label(mono(dns_type(d.query_type)).color(INK));
-                            ui.end_row();
-                            ui.label(caption("РЕЗУЛЬТАТ"));
+                            ui.label(caption("ВРЕМЯ ЗАПРОСА"));
                             ui.label(
-                                mono(format!("{} (код {})", d.status_label(), d.status))
-                                    .color(if d.status == 0 { NEON } else { PULSE }),
+                                mono(d.query_time().map(timestamp).unwrap_or_else(|| "—".into()))
+                                    .color(INK),
                             );
                             ui.end_row();
+                            ui.label(caption("РЕЗУЛЬТАТ"));
+                            let result = d.status_label();
+                            match d.status {
+                                Some(code) => {
+                                    ui.label(
+                                        mono(format!("{result} (код {code})"))
+                                            .color(if code == 0 { NEON } else { PULSE }),
+                                    )
+                                }
+                                None => ui.label(mono(result).color(INK_DIM)),
+                            };
+                            ui.end_row();
                             ui.label(caption("ОТВЕТ"));
-                            ui.label(mono(&d.results).color(INK));
+                            ui.label(
+                                mono(if d.results.is_empty() {
+                                    "—"
+                                } else {
+                                    &d.results
+                                })
+                                .color(INK),
+                            );
                             ui.end_row();
                             ui.label(caption("ИСТОЧНИК"));
                             ui.label(mono(&d.source).color(INK_DIM));
@@ -1591,11 +1803,14 @@ fn picker_choices(running: &[String], selected: &[String], query: &str) -> Vec<(
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(c) = &self.capture {
+            let finished = c.finished();
             self.live = c.snapshot();
-            if c.finished() {
+            if finished {
                 self.capture = None;
                 self.stopping = false;
-                self.refresh_history();
+                if self.capture_records_history {
+                    self.refresh_history();
+                }
             }
         }
         ctx.request_repaint_after(Duration::from_millis(if self.busy() { 300 } else { 1500 }));
@@ -1824,15 +2039,50 @@ mod picker_tests {
         let mut json = serde_json::to_value(Settings::default()).unwrap();
         json["filters"] = " game.exe ;GAME.exe, Launcher.exe".into();
         json["children"] = false.into();
+        json.as_object_mut().unwrap().remove("record_history");
         let mut settings: Settings = serde_json::from_value(json).unwrap();
         assert_eq!(settings.filters, ["game.exe", "Launcher.exe"]);
         assert!(!settings.children);
+        assert!(!settings.record_history);
+        settings.record_history = true;
         settings.filters.push("Game, Editor; Preview.exe".into());
         let saved = serde_json::to_vec(&settings).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Settings>(&saved).unwrap().filters,
-            settings.filters
-        );
+        let restored = serde_json::from_slice::<Settings>(&saved).unwrap();
+        assert_eq!(restored.filters, settings.filters);
+        assert!(restored.record_history);
+    }
+
+    #[test]
+    fn application_sets_restore_capture_inputs_without_replacing_recording_label() {
+        let mut settings = Settings {
+            filters: vec!["Steam.exe".into(), "game.exe".into()],
+            label: "Вечерняя проверка".into(),
+            children: false,
+            udp_idle: 45,
+            ..Default::default()
+        };
+        assert!(!settings.save_preset("Игры"));
+        assert_eq!(settings.presets[0].label, "Игры");
+
+        settings.filters = vec!["other.exe".into()];
+        settings.children = true;
+        settings.udp_idle = 10;
+        assert!(settings.load_preset("Игры"));
+        assert_eq!(settings.filters, ["Steam.exe", "game.exe"]);
+        assert!(!settings.children);
+        assert_eq!(settings.udp_idle, 45);
+        assert_eq!(settings.label, "Вечерняя проверка");
+        assert!(settings.preset_matches("Игры"));
+
+        settings.filters = vec!["new-game.exe".into()];
+        assert!(settings.save_preset("Игры"));
+        assert_eq!(settings.presets.len(), 1);
+        assert_eq!(settings.presets[0].exe_filters, ["new-game.exe"]);
+
+        let saved = serde_json::to_vec(&settings).unwrap();
+        let restored: Settings = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.presets[0].label, "Игры");
+        assert_eq!(restored.label, "Вечерняя проверка");
     }
 
     #[test]

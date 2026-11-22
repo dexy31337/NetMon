@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+const DATABASE_FILE: &str = "netmon.sqlite3";
+
 pub fn data_dir() -> PathBuf {
     std::env::var_os("NETMON_DATA_DIR")
         .map(PathBuf::from)
@@ -25,7 +27,7 @@ pub struct Store {
 impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir).context("Создание папки истории")?;
-        let db = Connection::open(dir.join("netmon.sqlite3")).context("Открытие истории SQLite")?;
+        let db = Connection::open(dir.join(DATABASE_FILE)).context("Открытие истории SQLite")?;
         db.busy_timeout(Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS recordings (id TEXT PRIMARY KEY, started INTEGER NOT NULL, payload TEXT NOT NULL);
@@ -62,6 +64,14 @@ impl Store {
             .prepare("SELECT payload FROM recordings ORDER BY started DESC LIMIT 500")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn list_existing(dir: &Path) -> Result<Vec<Recording>> {
+        if dir.join(DATABASE_FILE).try_exists()? {
+            Self::open(dir)?.list()
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     pub fn load(&self, id: &str) -> Result<Snapshot> {
@@ -220,6 +230,7 @@ pub fn export(snapshot: &Snapshot, dir: &Path) -> Result<PathBuf> {
         "results",
         "duration_ms",
         "source",
+        "request_time_utc_ms",
     ])?;
     for d in &snapshot.dns {
         csv.write_record([
@@ -228,10 +239,13 @@ pub fn export(snapshot: &Snapshot, dir: &Path) -> Result<PathBuf> {
             d.at.to_string(),
             d.name.clone(),
             dns_type(d.query_type),
-            d.status.to_string(),
+            d.status
+                .map(|status| status.to_string())
+                .unwrap_or_default(),
             d.results.clone(),
             d.duration_ms.map(|d| d.to_string()).unwrap_or_default(),
             d.source.clone(),
+            d.request_at.map(|at| at.to_string()).unwrap_or_default(),
         ])?;
     }
     csv.flush()?;

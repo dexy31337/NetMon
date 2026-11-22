@@ -99,7 +99,13 @@ fn main() -> Result<()> {
     for d in &snapshot.dns {
         println!(
             "DNS {} (PID {}) {} type={} status={} -> {} [{}]",
-            d.process.exe, d.process.pid, d.name, d.query_type, d.status, d.results, d.source
+            d.process.exe,
+            d.process.pid,
+            d.name,
+            d.query_type,
+            d.status_label(),
+            d.results,
+            d.source
         );
     }
     ensure!(snapshot.error.is_none(), "Capture error");
@@ -137,7 +143,7 @@ fn main() -> Result<()> {
             .iter()
             .any(|d| d.name.trim_end_matches('.') == "example.com"
                 && d.process.pid == child_pid
-                && d.status == 0
+                && d.status == Some(0)
                 && !d.results.is_empty()
                 && d.source.ends_with("/ 3008")),
         "No successful Windows DNS Client result attributed to the child"
@@ -148,7 +154,7 @@ fn main() -> Result<()> {
                 && d.query_type == kind
                 && d.process.pid == child_pid
                 && d.source.starts_with("UDP/53")
-                && d.status == 0
+                && d.status == Some(0)
                 && (kind == 28
                     || d.results
                         .split(';')
@@ -160,7 +166,7 @@ fn main() -> Result<()> {
         snapshot.dns.iter().any(|d| d.name == "netmon-probe.invalid"
             && d.process.pid == child_pid
             && d.source.starts_with(UDP_DNS_SOURCE)
-            && d.status == 3
+            && d.status == Some(3)
             && d.status_label() == "NXDOMAIN"),
         "No direct NXDOMAIN (wire RCODE 3) attributed to child PID {child_pid}"
     );

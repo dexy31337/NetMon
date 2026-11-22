@@ -1,6 +1,6 @@
 [package]
 name = "netmon"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Per-process Windows network and DNS monitor"
 license = "PolyForm-Noncommercial-1.0.0"
