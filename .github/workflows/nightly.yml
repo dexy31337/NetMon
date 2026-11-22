@@ -30,6 +30,7 @@ jobs:
           cargo build --release --locked --bin netmon
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item -LiteralPath target/release/netmon.exe -Destination dist/NetMon.exe
+          Copy-Item -LiteralPath LICENSE.md -Destination dist/LICENSE.md
           $hash = (Get-FileHash -LiteralPath dist/NetMon.exe -Algorithm SHA256).Hash
           Set-Content -LiteralPath dist/SHA256.txt -Encoding ascii -Value "$hash  NetMon.exe"
 
@@ -48,7 +49,7 @@ jobs:
           $commit = "$env:GITHUB_SERVER_URL/$env:GH_REPO/commit/$env:GITHUB_SHA"
           $run = "$env:GITHUB_SERVER_URL/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID"
           $notes = "Windows x64 build from [$($env:GITHUB_SHA.Substring(0, 7))]($commit). [Build log]($run)."
-          $assets = @('dist/NetMon.exe', 'dist/SHA256.txt')
+          $assets = @('dist/NetMon.exe', 'dist/SHA256.txt', 'dist/LICENSE.md')
 
           $existing = gh api --paginate "repos/$env:GH_REPO/releases?per_page=100" --jq '.[] | select(.tag_name == "nightly") | .tag_name'
           if ($existing -eq 'nightly') {
