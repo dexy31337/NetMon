@@ -1,0 +1,30 @@
+[package]
+name = "netmon"
+version = "0.1.0"
+edition = "2024"
+description = "Per-process Windows network and DNS monitor"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+csv = "1"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+egui_extras = "0.31"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Etw", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_Time", "Win32_System_SystemInformation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bin]]
+name = "netmon"
+path = "src/main.rs"
+
+[[bin]]
+name = "netmon-probe"
+path = "src/bin/probe.rs"

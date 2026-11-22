@@ -1,0 +1,8 @@
+/target/
+/.tools/
+/data/
+/artifacts/
+*.etl
+*.db
+*.db-shm
+*.db-wal
