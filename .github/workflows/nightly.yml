@@ -1,0 +1,60 @@
+name: NetMon Nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: netmon-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build and package
+        run: |
+          cargo build --release --locked --bin netmon
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item -LiteralPath target/release/netmon.exe -Destination dist/NetMon.exe
+          $hash = (Get-FileHash -LiteralPath dist/NetMon.exe -Algorithm SHA256).Hash
+          Set-Content -LiteralPath dist/SHA256.txt -Encoding ascii -Value "$hash  NetMon.exe"
+
+      - name: Publish Nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $main = gh api "repos/$env:GH_REPO/git/ref/heads/main" --jq '.object.sha'
+          if ($main -ne $env:GITHUB_SHA) {
+            Write-Output "A newer push to main superseded this build."
+            exit 0
+          }
+
+          $commit = "$env:GITHUB_SERVER_URL/$env:GH_REPO/commit/$env:GITHUB_SHA"
+          $run = "$env:GITHUB_SERVER_URL/$env:GH_REPO/actions/runs/$env:GITHUB_RUN_ID"
+          $notes = "Windows x64 build from [$($env:GITHUB_SHA.Substring(0, 7))]($commit). [Build log]($run)."
+          $assets = @('dist/NetMon.exe', 'dist/SHA256.txt')
+
+          $existing = gh api --paginate "repos/$env:GH_REPO/releases?per_page=100" --jq '.[] | select(.tag_name == "nightly") | .tag_name'
+          if ($existing -eq 'nightly') {
+            gh release upload nightly @assets --clobber
+            gh api --method PATCH "repos/$env:GH_REPO/git/refs/tags/nightly" -f "sha=$env:GITHUB_SHA" -F force=true --silent
+            gh release edit nightly --title 'NetMon Nightly' --notes $notes --prerelease --latest=false
+          } else {
+            gh release create nightly @assets --target $env:GITHUB_SHA --title 'NetMon Nightly' --notes $notes --prerelease --latest=false
+          }
