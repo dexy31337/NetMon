@@ -1,10 +1,35 @@
-# NetMon
+<h1 align="center">
+  <img src=".github/assets/netmon-banner.svg" width="688" alt="NetMon">
+</h1>
 
-Локальный монитор сетевых обращений приложений для Windows 11 x64. Rust, ETW, egui и SQLite.
+<p align="center">
+  <strong>Посмотрите, к каким серверам подключаются ваши игры, лаунчеры и приложения.</strong><br>
+  Сетевые соединения, DNS и история записей в одном окне на Windows 11 x64.
+</p>
+
+<p align="center">
+  <a href="https://github.com/dexy31337/NetMon/releases/latest/download/NetMon.exe"><strong>↓ Скачать NetMon.exe</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/dexy31337/NetMon/releases/latest">Текущий релиз</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/dexy31337/NetMon/releases/tag/nightly">Nightly</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/dexy31337/NetMon/releases/latest"><img src="https://img.shields.io/github/v/release/dexy31337/NetMon?label=Latest&amp;color=00a9b9&amp;style=flat-square" alt="Версия стабильного релиза"></a>
+</p>
+
+<p align="center">
+  <a href="#запуск">Запуск</a>
+  &nbsp;·&nbsp;
+  <a href="#представления">Что умеет NetMon</a>
+  &nbsp;·&nbsp;
+  <a href="#сборка">Сборка из исходников</a>
+</p>
 
 ## Запуск
 
-Готовая сборка: `artifacts/NetMon/NetMon.exe`. При запуске Windows запросит права администратора.
+Скачайте [NetMon.exe для Windows 11 x64](https://github.com/dexy31337/NetMon/releases/latest/download/NetMon.exe) и запустите его. Windows запросит права администратора.
 Установка службы, драйвера и изменения сетевых настроек не нужны.
 
 1. В разделе **Приложения** раскройте список и отметьте одно или несколько имён EXE. Поиск работает без учёта регистра. Например, выбор `game.exe` охватывает все его запущенные копии и экземпляры, которые появятся во время записи, из любой папки.
